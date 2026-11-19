@@ -12,6 +12,14 @@ run anywhere except a disposable Linux container:
 docker run --rm -v "$PWD":/src -w /src ubuntu:24.04 bash tests/ci.sh
 ```
 
-`tests/ci.sh` installs `lsof procps python3 jq shellcheck`, runs shellcheck and syntax checks, then
-both suites. CI also runs `/bin/bash -n` and a dry-run `macclean scan` on a macOS runner, which
-covers macOS's bash 3.2 and BSD tools.
+`tests/test_update.sh` covers `macclean update` and the Mole setup without any network: releases
+are local `file://` archives (good, mismatched version, broken syntax, not an archive, missing),
+and Homebrew and Mole's installer are stubs that record how they were called. It checks that a
+current Mole is left alone, an old one is updated through the channel that installed it, a
+missing one is installed, and a bad release is refused with nothing changed. Test-only overrides
+(`MACCLEAN_TEST_*`) work only with `MACCLEAN_TEST_SANDBOX=1` and never on macOS.
+
+`tests/ci.sh` installs `lsof procps python3 jq shellcheck curl bsdutils`, runs shellcheck and
+syntax checks, then all three suites. CI also runs `/bin/bash -n`, a dry-run `macclean scan`,
+`bootstrap.sh --dry-run` and `macclean update --check` on a macOS runner, which covers macOS's
+bash 3.2, BSD tools and the real GitHub release download.

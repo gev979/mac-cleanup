@@ -1,7 +1,8 @@
 #!/bin/bash
 # shellcheck disable=SC2088  # literal '~' is intentional (display / manual expansion)
 #
-# MacClean installer. Run it as your normal user (NOT with sudo):
+# MacClean installer. Run it as your normal user (NOT with sudo). The one-line install
+# (bootstrap.sh) downloads the latest release and runs this file; from a clone or a copy:
 #
 #     bash ~/MacClean/install.sh
 #
@@ -10,16 +11,19 @@
 #   2. links /usr/local/bin/macclean
 #   3. adds /etc/sudoers.d/macclean - passwordless ONLY for the fixed-action helper
 #      (macclean-root check|scan|clean|deep-scan|deep), nothing else
-#   4. prepares ~/MacClean (config, queue, reports) and protects the Trash in Mole's whitelist
-#   5. creates ~/Applications/MacClean Agent.app + a LaunchAgent that serves the request
+#   4. Mole: keeps a current one, updates an old one the way it was installed (Homebrew or
+#      Mole's installer), installs it only if missing (Homebrew is not required)
+#   5. prepares ~/MacClean (config, queue, reports) and protects the Trash in Mole's whitelist
+#   6. creates ~/Applications/MacClean Agent.app + a LaunchAgent that serves the request
 #      queue (used by Claude in Cowork) and runs the weekly clean when the Mac is idle
-#   6. Claude Code: installs the mac-cleanup skill + allow-rules (settings.json is backed up)
-#   7. helps you give the agent Full Disk Access, then verifies the whole chain
+#   7. Claude Code: installs the mac-cleanup skill + allow-rules (settings.json is backed up)
+#   8. opens Full Disk Access for the agent and notices by itself when you switch it on
 #
-# Re-running is safe (idempotent). Undo everything with: bash ~/MacClean/uninstall.sh
+# Re-running is safe (idempotent). Update later with: macclean update
+# Undo everything with: bash ~/MacClean/uninstall.sh
 
 set -u
-INSTALLER_VERSION="1.0.0"
+INSTALLER_VERSION="1.1.0"
 AGENT_APP_VERSION="1"
 SRC_DIR=$(cd "$(dirname "$0")" && pwd -P)
 MC_HOME="$HOME/MacClean"
@@ -74,13 +78,13 @@ if [ "$SRC_DIR" != "$(cd -P "$MC_HOME" && pwd -P)" ]; then
     mkdir -p "$MC_HOME/bin" "$MC_HOME/claude-code"
     cp -f "$SRC_DIR/bin/macclean" "$SRC_DIR/bin/macclean-root" "$MC_HOME/bin/"
     cp -f "$SRC_DIR/claude-code/SKILL.md" "$MC_HOME/claude-code/"
-    for f in install.sh uninstall.sh README.md config.default LICENSE; do [ -f "$SRC_DIR/$f" ] && cp -f "$SRC_DIR/$f" "$MC_HOME/"; done
+    for f in install.sh uninstall.sh bootstrap.sh README.md CHANGELOG.md config.default LICENSE; do [ -f "$SRC_DIR/$f" ] && cp -f "$SRC_DIR/$f" "$MC_HOME/"; done
 fi
 # Your settings live in ~/MacClean/config; updates never overwrite it.
 [ -f "$MC_HOME/config" ] || cp "$DEFAULT_CONFIG" "$MC_HOME/config"
 
 # ---------------------------------------------------------------------------
-step "1/7  Admin password (asked once)"
+step "1/8  Admin password (asked once)"
 sudo -v || die "sudo failed"
 (while sudo -n true 2>/dev/null; do sleep 45; kill -0 "$$" 2>/dev/null || exit 0; done) &
 KEEPALIVE=$!
@@ -88,7 +92,7 @@ disown "$KEEPALIVE" 2>/dev/null
 trap 'kill "$KEEPALIVE" 2>/dev/null' EXIT
 
 # ---------------------------------------------------------------------------
-step "2/7  Install scripts into $OPT/bin (root-owned, not writable by you)"
+step "2/8  Install scripts into $OPT/bin (root-owned, not writable by you)"
 [ -d /opt ] || sudo /bin/mkdir -m 755 /opt || die "cannot create /opt"
 sudo /bin/mkdir -p "$OPT/bin" || die "cannot create $OPT/bin"
 sudo /usr/sbin/chown root:wheel "$OPT" "$OPT/bin"
@@ -107,12 +111,12 @@ done
 ok "macclean and macclean-root installed"
 
 # ---------------------------------------------------------------------------
-step "3/7  Command shortcut"
+step "3/8  Command shortcut"
 sudo /bin/mkdir -p /usr/local/bin
 sudo /bin/ln -sfn "$OPT/bin/macclean" /usr/local/bin/macclean && ok "/usr/local/bin/macclean -> $OPT/bin/macclean"
 
 # ---------------------------------------------------------------------------
-step "4/7  Passwordless sudo for the fixed-action helper only"
+step "4/8  Passwordless sudo for the fixed-action helper only"
 if ! sudo /usr/bin/grep -Eq '^[[:space:]]*[#@]includedir[[:space:]]+/(private/)?etc/sudoers\.d' /etc/sudoers; then
     warn "/etc/sudoers does not include /etc/sudoers.d - skipped (system-level cleanup will be skipped)."
 else
@@ -137,23 +141,26 @@ else
         die "generated sudoers rule did not validate - nothing changed."
     fi
 fi
-kill "$KEEPALIVE" 2>/dev/null
-sudo -k
-if out=$(sudo -n "$HELPER" check 2>&1); then ok "verified without a password: $out"; else warn "passwordless check failed: $out"; fi
 
 # ---------------------------------------------------------------------------
-step "5/7  ~/MacClean folder, schedule state, Mole whitelist"
-[ -f "$MC_HOME/.state/last_scheduled" ] || date +%s >"$MC_HOME/.state/last_scheduled"
-if command -v mo >/dev/null 2>&1 || [ -x /opt/homebrew/bin/mo ]; then
-    MO_BIN=$(command -v mo 2>/dev/null || echo /opt/homebrew/bin/mo)
-    ok "Mole found: $("$MO_BIN" --version </dev/null 2>/dev/null | grep -i -m1 -E 'mole|[0-9]+\.[0-9]+\.[0-9]+')"
+# Runs while the password is still cached: Mole's own installer may need it for /usr/local/bin.
+step "5/8  Mole (checked first: kept if current, updated if old, installed only if missing)"
+if "$OPT/bin/macclean" _ensure-mole; then
+    ok "Mole is ready"
 else
-    warn "Mole (mo) not found. MacClean works without it, but install it for the broad cleanup: brew install mole"
+    warn "Mole could not be set up now. MacClean works without it; run 'macclean update' later to retry."
 fi
+kill "$KEEPALIVE" 2>/dev/null
+sudo -k
+if out=$(sudo -n "$HELPER" check 2>&1); then ok "helper verified without a password: $out"; else warn "passwordless check failed: $out"; fi
+
+# ---------------------------------------------------------------------------
+step "6/8  ~/MacClean folder, schedule state, Mole whitelist"
+[ -f "$MC_HOME/.state/last_scheduled" ] || date +%s >"$MC_HOME/.state/last_scheduled"
 "$OPT/bin/macclean" _ensure-whitelist && ok "Mole whitelist protects Trash, Xcode archives, ~/.aws and Claude desktop caches"
 
 # ---------------------------------------------------------------------------
-step "6/7  Background agent (request queue + weekly clean when idle)"
+step "7/8  Background agent (request queue + weekly clean when idle)"
 make_app=1
 if [ -d "$APP" ]; then
     bid=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist" 2>/dev/null)
@@ -225,7 +232,7 @@ launchctl bootstrap "gui/$(id -u)" "$PLIST" || die "launchctl bootstrap failed"
 ok "LaunchAgent $LABEL loaded (queue: ~/MacClean/queue, schedule check every 30 min)"
 
 # ---------------------------------------------------------------------------
-step "7/7  Claude Code integration"
+step "8/8  Claude Code integration"
 CC_RULES=("Bash(macclean:*)" "Bash(macclean)" "Bash(/usr/local/bin/macclean:*)" "Bash(/opt/macclean/bin/macclean:*)"
     "Bash(mo --version)" "Bash(mo clean --dry-run:*)" "Bash(mo purge --dry-run:*)" "Bash(mo analyze --json:*)"
     "Bash(mo status --json:*)" "Bash(mo history --json:*)" "Bash(df -h:*)")
@@ -282,34 +289,52 @@ done
 
 # ---------------------------------------------------------------------------
 step "Full Disk Access for 'MacClean Agent' (lets the agent and Mole reach Trash, Safari and app caches)"
-printf '%s %s source=%s\n' "$INSTALLER_VERSION" "$(date '+%Y-%m-%d %H:%M:%S')" "$SRC_DIR" >"$MC_HOME/.state/installed"
+printf '%s %s source=%s\n' "$INSTALLER_VERSION" "$(date '+%Y-%m-%d %H:%M:%S')" "${MACCLEAN_INSTALL_ORIGIN:-$SRC_DIR}" >"$MC_HOME/.state/installed"
 fda_ok=0
-check_fda() {
-    local out
-    out=$("$OPT/bin/macclean" queue status --wait 90 2>&1)
+check_fda() { # WAIT_SECONDS -> asks the agent itself; removes the check's own request and report files
+    local out id
+    out=$("$OPT/bin/macclean" queue status --wait "$1" 2>&1)
+    id=$(printf '%s\n' "$out" | sed -n "s/^Queued 'status' for the background agent as //p" | head -n 1)
+    case "$id" in
+        '' | *[!A-Za-z0-9._-]*) ;;
+        *) rm -f "$MC_HOME/queue/$id.req" "$MC_HOME/reports/$id.log" "$MC_HOME/reports/$id.summary.txt" \
+            "$MC_HOME/reports/$id.done" "$MC_HOME/reports/$id.request" ;;
+    esac
     case "$out" in *"Full Disk Access (this process): yes"*) return 0 ;; esac
     return 1
 }
-if check_fda; then
+if check_fda 90; then
     fda_ok=1
     ok "agent already has Full Disk Access"
 elif [ -t 0 ]; then
     open "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles" 2>/dev/null ||
         open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null
     open -R "$APP" 2>/dev/null
+    printf '%s' "$APP" | pbcopy 2>/dev/null
     printf '    System Settings > Privacy & Security > Full Disk Access is open, and Finder shows\n'
-    printf '    "MacClean Agent". Drag it into the list (or click + and pick it), and switch it ON.\n'
-    printf '    Press Enter when done (or type s and Enter to skip): '
-    read -r ans
-    if [ "${ans:-}" != s ]; then
-        if check_fda; then fda_ok=1; ok "Full Disk Access confirmed"; else warn "not confirmed yet - Mole will only run from Terminal/Claude Code until it is granted"; fi
-    fi
+    printf '    "MacClean Agent". Drag it into the list and switch it ON. (Or click +, press\n'
+    printf '    Cmd+Shift+G, paste with Cmd+V - the path is on your clipboard - and press Enter.)\n'
+    printf '    Waiting for the switch; this continues by itself. Press Enter to skip.\n'
+    fda_deadline=$(($(date +%s) + 900))
+    while [ "$(date +%s)" -lt "$fda_deadline" ]; do
+        if check_fda 30; then
+            fda_ok=1
+            ok "Full Disk Access confirmed"
+            break
+        fi
+        if read -r -t 8 _; then
+            # Enter may come right after switching it on: one last look before calling it skipped.
+            if check_fda 30; then fda_ok=1; ok "Full Disk Access confirmed"; else warn "skipped"; fi
+            break
+        fi
+    done
+    [ "$fda_ok" = 1 ] || warn "not confirmed - Mole runs only from Terminal/Claude Code until 'MacClean Agent' has Full Disk Access"
 else
     warn "no terminal - grant Full Disk Access to $APP later in System Settings"
 fi
 
 step "Done"
 "$OPT/bin/macclean" status
-printf '\nTry:  macclean scan     (preview, changes nothing)\n      macclean clean    (normal clean)\n'
+printf '\nTry:  macclean scan     (preview, changes nothing)\n      macclean clean    (normal clean)\n      macclean update   (later: newer MacClean / Mole)\n'
 [ "$fda_ok" = 1 ] || printf '\nReminder: give "MacClean Agent" Full Disk Access so background runs include Mole.\n'
 printf 'Install log: %s\n' "$(tild "$INSTALL_LOG")"

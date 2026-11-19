@@ -3,7 +3,7 @@
 # MacClean uninstaller:  bash ~/MacClean/uninstall.sh
 # Removes the agent, the LaunchAgent, /opt/macclean, the sudoers rule, the command
 # link and the Claude Code skill + allow-rules it added. Keeps ~/MacClean (your config
-# and reports) and Mole's whitelist - delete those yourself if you want.
+# and reports), Mole itself and Mole's whitelist - delete those yourself if you want.
 
 set -u
 LABEL=local.macclean.agent
@@ -47,4 +47,5 @@ function run(argv) {
 }
 JXA
 done
-echo "Done. Kept: ~/MacClean (config + reports) and ~/.config/mole/whitelist."
+echo "Done. Kept: ~/MacClean (config + reports), Mole and ~/.config/mole/whitelist."
+echo "To remove Mole too: 'brew uninstall mole' if it came from Homebrew, otherwise 'mo remove'."

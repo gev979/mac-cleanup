@@ -14,6 +14,8 @@
 #                          old, old Puppeteer browsers, Time Machine local snapshots
 #   macclean report        what is using space (sizes only, deletes nothing)
 #   macclean status        installation health, schedule, last runs
+#   macclean update        update MacClean and Mole when newer versions exist (asks for
+#                          your password once); --check only looks, changes nothing
 #   macclean queue MODE [--wait SECONDS]
 #                          ask the background agent (which has Full Disk Access)
 #                          to run MODE; optionally wait and print the summary
@@ -25,9 +27,10 @@
 # command line (ps), and contains no sockets. Temporary items also need an age
 # threshold. scan / deep-scan / report / status never delete anything.
 
-MACCLEAN_VERSION="1.0.0"
+MACCLEAN_VERSION="1.1.0"
 
 umask 022
+CALLER_PATH=${PATH:-}
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:${HOME:-/nonexistent}/.local/bin:${HOME:-/nonexistent}/.orbstack/bin:${HOME:-/nonexistent}/.docker/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 set -u
 
@@ -52,6 +55,20 @@ ROOT_HELPER="${MACCLEAN_ROOT_HELPER:-/opt/macclean/bin/macclean-root}"
 AGENT_LABEL="local.macclean.agent"
 AGENT_APP="$HOME/Applications/MacClean Agent.app"
 MOLE_WL="$HOME/.config/mole/whitelist"
+MACCLEAN_REPO="gev979/mac-cleanup"
+GITHUB_WEB="https://github.com"
+# The Mole version MacClean is tested with: an older Mole gets updated, a newer one is left alone.
+# Mole's own installer for it is pinned by commit (tag V1.73.0) and checksum; bump all three together.
+MOLE_TESTED_VERSION="1.73.0"
+MOLE_INSTALLER_URL="https://raw.githubusercontent.com/tw93/Mole/fd8af6fb63256d453c9821e2a7e626b39d56a071/install.sh"
+MOLE_INSTALLER_SHA256="55bffa6b1c0828481d09acaaae1525e0c08e5be33d79fd91ebfd35979ecdd2e1"
+# Test-only overrides (local fixtures). Ignored on macOS.
+if [ "$OS" != Darwin ] && [ "${MACCLEAN_TEST_SANDBOX:-0}" = 1 ]; then
+    GITHUB_WEB="${MACCLEAN_TEST_GITHUB:-$GITHUB_WEB}"
+    MOLE_INSTALLER_URL="${MACCLEAN_TEST_MOLE_INSTALLER:-$MOLE_INSTALLER_URL}"
+    MOLE_INSTALLER_SHA256="${MACCLEAN_TEST_MOLE_INSTALLER_SHA256:-$MOLE_INSTALLER_SHA256}"
+fi
+UPDATE_TMP=""
 TAB=$(printf '\t')
 NL='
 '
@@ -68,6 +85,7 @@ LSOF_FILE=/dev/null
 PS_FILE=/dev/null
 HAS_FDA=unknown
 MOLE_BIN=""
+BREW_BIN=""
 MOLE_SUMMARY=""
 MOLE_PURGE_SUMMARY=""
 DOCKER_SUMMARY=""
@@ -815,7 +833,7 @@ find_mole() {
 
 mole_allowed_here() {
     [ "$USE_MOLE" = 1 ] || { note "Mole step disabled in config (USE_MOLE=0)."; return 1; }
-    find_mole || { note "Mole (mo) not found - install it with: brew install mole"; return 1; }
+    find_mole || { note "Mole (mo) not found - install it with: macclean update"; return 1; }
     if [ "$IN_AGENT" = 1 ] && [ "$HAS_FDA" != 1 ]; then
         note "Mole was skipped in the background agent because 'MacClean Agent' has no Full Disk Access yet (System Settings > Privacy & Security > Full Disk Access)."
         return 1
@@ -884,6 +902,268 @@ EOF
 mole_version() {
     "$MOLE_BIN" --version </dev/null 2>/dev/null | tr -d '\r' | sed "s/${ESC}\\[[0-9;?]*[A-Za-z]//g" |
         grep -i -m1 -E 'mole|[0-9]+\.[0-9]+\.[0-9]+' | sed 's/^[[:space:]]*//'
+}
+
+# ----------------------------------------------------------------------------
+# Dependencies and updates: check first, update what is old the way it was
+# installed, install only what is missing.
+# ----------------------------------------------------------------------------
+version_lt() { # A B -> true if version A is older than B (numeric parts, missing parts count as 0)
+    awk -v a="$1" -v b="$2" 'BEGIN {
+        n = split(a, x, "."); m = split(b, y, "."); k = (n > m) ? n : m
+        for (i = 1; i <= k; i++) { p = x[i] + 0; q = y[i] + 0; if (p < q) exit 0; if (p > q) exit 1 }
+        exit 1 }'
+}
+
+mole_version_number() { mole_version | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1; }
+
+find_brew() {
+    local c
+    for c in "$(command -v brew 2>/dev/null)" /opt/homebrew/bin/brew /usr/local/bin/brew; do
+        if [ -n "$c" ] && [ -x "$c" ]; then
+            BREW_BIN=$c
+            return 0
+        fi
+    done
+    return 1
+}
+
+mole_link_target() { # absolute target of MOLE_BIN if it is a symlink, else empty
+    local t
+    t=$(readlink "$MOLE_BIN" 2>/dev/null) || return 0
+    case "$t" in '') ;; /*) printf '%s' "$t" ;; *) printf '%s/%s' "${MOLE_BIN%/*}" "$t" ;; esac
+}
+
+mole_channel() { # how the Mole in MOLE_BIN was installed: brew | script | other
+    local target
+    target=$(mole_link_target)
+    case "$MOLE_BIN $target" in */Cellar/mole/*) echo brew; return 0 ;; esac
+    case "${MOLE_BIN%/*}" in /usr/local/bin | "$HOME/.local/bin") ;; *) echo other; return 0 ;; esac
+    # Mole's installer links mo -> mole in the same folder; a link to anywhere else is someone else's setup.
+    if [ -n "$target" ] && [ "${target%/*}" != "${MOLE_BIN%/*}" ] && [ "${target%/*}" != "${MOLE_BIN%/*}/." ]; then
+        echo other
+        return 0
+    fi
+    echo script
+}
+
+find_brew_for_mole() { # the brew whose Cellar holds this Mole (two Homebrews can coexist), else any brew
+    local full prefix
+    full=$(mole_link_target)
+    [ -n "$full" ] || full=$MOLE_BIN
+    case "$full" in
+        */Cellar/mole/*)
+            prefix=${full%%/Cellar/mole/*}
+            if [ -x "$prefix/bin/brew" ]; then
+                BREW_BIN="$prefix/bin/brew"
+                return 0
+            fi
+            ;;
+    esac
+    find_brew
+}
+
+run_brew() { NONINTERACTIVE=1 HOMEBREW_NO_ENV_HINTS=1 "$BREW_BIN" "$@" </dev/null; }
+
+sha256_of() {
+    if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1"; else sha256sum "$1"; fi 2>/dev/null | awk '{print $1}'
+}
+
+run_mole_installer() { # [INSTALL_DIR] -> Mole's own installer, pinned by commit and checksum
+    local f rc
+    f=$(mktemp "${TMPDIR:-/tmp}/macclean-mole-install.XXXXXX") || return 1
+    if ! curl -fsSL --connect-timeout 15 --max-time 120 -o "$f" "$MOLE_INSTALLER_URL"; then
+        rm -f "$f"
+        echo "!! Could not download Mole's installer from $MOLE_INSTALLER_URL"
+        return 1
+    fi
+    if [ "$(sha256_of "$f")" != "$MOLE_INSTALLER_SHA256" ]; then
+        rm -f "$f"
+        echo "!! Mole's installer does not match its expected checksum - not run."
+        return 1
+    fi
+    if [ -n "${1:-}" ]; then
+        /bin/bash "$f" --prefix "$1" "$MOLE_TESTED_VERSION" </dev/null
+    else
+        /bin/bash "$f" "$MOLE_TESTED_VERSION" </dev/null
+    fi
+    rc=$?
+    rm -f "$f"
+    return "$rc"
+}
+
+ensure_mole() { # [check] -> keep a current Mole, update an old one, install a missing one
+    local check="${1:-}" have how other
+    if [ "$USE_MOLE" != 1 ]; then
+        echo "Mole: turned off in config (USE_MOLE=0) - not installed or updated."
+        return 0
+    fi
+    if find_mole; then
+        have=$(mole_version_number)
+        if [ -z "$have" ]; then
+            echo "Mole at $MOLE_BIN: version unknown - left as is."
+            return 0
+        fi
+        if ! version_lt "$have" "$MOLE_TESTED_VERSION"; then
+            echo "Mole $have: up to date (MacClean is tested with $MOLE_TESTED_VERSION) - left as is."
+            return 0
+        fi
+        how=$(mole_channel)
+        if [ "$check" = check ]; then
+            echo "Mole $have: older than $MOLE_TESTED_VERSION - 'macclean update' updates it."
+            return 0
+        fi
+        case "$how" in
+            brew)
+                if ! find_brew_for_mole; then
+                    echo "!! Mole $have came from Homebrew, but brew was not found. Update it with: brew upgrade mole"
+                    return 1
+                fi
+                echo "Mole $have is older than $MOLE_TESTED_VERSION - updating it with Homebrew ($BREW_BIN)..."
+                run_brew upgrade mole || { echo "!! 'brew upgrade mole' failed - MacClean keeps using Mole $have."; return 1; }
+                ;;
+            script)
+                echo "Mole $have is older than $MOLE_TESTED_VERSION - updating it in place with Mole's installer..."
+                run_mole_installer "${MOLE_BIN%/*}" || { echo "!! Mole's installer failed - MacClean keeps using Mole $have."; return 1; }
+                ;;
+            *)
+                echo "!! Mole $have ($MOLE_BIN) is older than $MOLE_TESTED_VERSION and was not installed by Homebrew or Mole's installer. Update it the way you installed it."
+                return 1
+                ;;
+        esac
+    else
+        other=$(PATH=$CALLER_PATH && command -v mo 2>/dev/null)
+        if [ -n "$other" ] && "$other" --version </dev/null 2>/dev/null | grep -qi mole; then
+            echo "!! Mole found at $other, outside the folders MacClean searches (/opt/homebrew/bin, /usr/local/bin, ~/.local/bin). Left alone; link it into one of those folders so MacClean can use it."
+            [ "$check" = check ]
+            return
+        fi
+        if [ "$check" = check ]; then
+            echo "Mole: not installed - 'macclean update' installs it."
+            return 0
+        fi
+        if find_brew; then
+            echo "Mole not found - installing it with Homebrew..."
+            run_brew install mole || { echo "!! 'brew install mole' failed."; return 1; }
+        else
+            echo "Mole not found - installing Mole $MOLE_TESTED_VERSION with its own installer (Homebrew is not needed)..."
+            run_mole_installer || { echo "!! Mole's installer failed."; return 1; }
+        fi
+    fi
+    MOLE_BIN=""
+    if ! find_mole; then
+        echo "!! Mole is still not found after installing it."
+        return 1
+    fi
+    have=$(mole_version_number)
+    echo "Mole ready: $(mole_version) ($MOLE_BIN)"
+    if version_lt "${have:-0}" "$MOLE_TESTED_VERSION"; then
+        echo "Note: this is still older than $MOLE_TESTED_VERSION (the newest its source offers right now)."
+    fi
+    return 0
+}
+
+valid_tag() { case "$1" in v[0-9]*) ;; *) return 1 ;; esac; case "$1" in *[!A-Za-z0-9._-]*) return 1 ;; esac; return 0; }
+
+latest_release_tag() { # newest MacClean release tag on GitHub, e.g. v1.1.0
+    local url tag
+    # .../releases/latest redirects to .../releases/tag/<tag> (no API key or rate limit involved)
+    url=$(curl -fsSIL --connect-timeout 10 --max-time 30 -o /dev/null -w '%{url_effective}' \
+        "$GITHUB_WEB/$MACCLEAN_REPO/releases/latest" 2>/dev/null) || return 1
+    tag=${url##*/}
+    valid_tag "$tag" || return 1
+    printf '%s' "$tag"
+}
+
+fetch_release() { # TAG DIR -> downloads and checks the release, prints its folder
+    local tag="$1" dir="$2" top n f v
+    if ! curl -fsSL --connect-timeout 10 --max-time 300 -o "$dir/release.tar.gz" \
+        "$GITHUB_WEB/$MACCLEAN_REPO/archive/refs/tags/$tag.tar.gz"; then
+        echo "Download of $tag failed." >&2
+        return 1
+    fi
+    mkdir -p "$dir/src" || return 1
+    tar -xzf "$dir/release.tar.gz" -C "$dir/src" 2>/dev/null || { echo "The download is not a valid archive." >&2; return 1; }
+    n=$(find "$dir/src" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
+    top=$(find "$dir/src" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+    if [ "$n" != 1 ] || [ -z "$top" ]; then
+        echo "Unexpected archive layout." >&2
+        return 1
+    fi
+    for f in install.sh bin/macclean bin/macclean-root; do
+        [ -f "$top/$f" ] || { echo "The release has no $f." >&2; return 1; }
+        /bin/bash -n "$top/$f" 2>/dev/null || { echo "$f in the release fails the syntax check." >&2; return 1; }
+    done
+    v=$(sed -n 's/^MACCLEAN_VERSION="\([^"]*\)"$/\1/p' "$top/bin/macclean" | head -n 1)
+    if [ "$v" != "${tag#v}" ]; then
+        echo "Release $tag contains MacClean '$v' - refusing it." >&2
+        return 1
+    fi
+    printf '%s' "$top"
+}
+
+new_update_tmp() { # a scratch folder that on_exit removes, also on Ctrl-C
+    mkdir -p "$INBOX_TMP" && UPDATE_TMP=$(mktemp -d "$INBOX_TMP/update.XXXXXX")
+}
+
+cmd_update() { # [--check] [--force]
+    local check=0 force=0 tag latest action=none top rc mole_mode=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --check) check=1 ;;
+            --force) force=1 ;;
+            *) echo "usage: macclean update [--check] [--force]" >&2; exit 2 ;;
+        esac
+        shift
+    done
+    [ "$check" = 1 ] && mole_mode=check
+    load_config
+    if [ "$check" = 0 ]; then
+        if [ ! -t 0 ]; then
+            echo "Run 'macclean update' in Terminal: it may ask for your password once. ('macclean update --check' only looks.)" >&2
+            exit 2
+        fi
+        # Updating restarts the agent and may replace Mole, so never in the middle of a clean.
+        if ! acquire_lock 0; then
+            echo "A MacClean run is in progress - run 'macclean update' again when it has finished." >&2
+            exit 75
+        fi
+    fi
+    printf 'MacClean %s - checking github.com/%s for a newer release...\n' "$MACCLEAN_VERSION" "$MACCLEAN_REPO"
+    if ! tag=$(latest_release_tag); then
+        echo "Could not find the latest MacClean release (offline, or GitHub unreachable). Checking Mole anyway." >&2
+        ensure_mole ${mole_mode:+"$mole_mode"}
+        exit 1
+    fi
+    latest=${tag#v}
+    if version_lt "$MACCLEAN_VERSION" "$latest"; then
+        action=update
+    elif version_lt "$latest" "$MACCLEAN_VERSION"; then
+        echo "This MacClean ($MACCLEAN_VERSION) is newer than the latest release ($latest) - nothing to update."
+    elif [ "$force" = 1 ] && [ "$check" = 0 ]; then
+        action=reinstall
+    else
+        echo "MacClean is up to date ($MACCLEAN_VERSION)."
+    fi
+    if [ "$action" = none ]; then
+        ensure_mole ${mole_mode:+"$mole_mode"}
+        return
+    fi
+    if [ "$check" = 1 ]; then
+        echo "Update available: MacClean $latest (you have $MACCLEAN_VERSION). Run: macclean update"
+        ensure_mole check
+        return 0
+    fi
+    new_update_tmp || exit 1
+    echo "Downloading MacClean $latest..."
+    if ! top=$(fetch_release "$tag" "$UPDATE_TMP"); then
+        echo "Update stopped - nothing was changed." >&2
+        exit 1
+    fi
+    echo "Release checked. Running its installer (it also checks Mole)..."
+    MACCLEAN_INSTALL_ORIGIN="release $tag (github.com/$MACCLEAN_REPO)" /bin/bash "$top/install.sh"
+    rc=$?
+    exit "$rc"
 }
 
 run_mole_clean() {
@@ -1095,6 +1375,7 @@ release_lock() {
 
 on_exit() {
     if [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ]; then rm -rf -- "$RUN_DIR"; fi
+    if [ -n "$UPDATE_TMP" ] && [ -d "$UPDATE_TMP" ]; then rm -rf -- "$UPDATE_TMP"; fi
     release_lock
 }
 trap on_exit EXIT
@@ -1300,7 +1581,14 @@ mode_status() {
     if [ -x /opt/macclean/bin/macclean ]; then printf '  Installed: /opt/macclean/bin (root-owned)\n'; else printf '  Installed: NO - run: bash ~/MacClean/install.sh\n'; fi
     out=$(run_timeout 20 sudo -n "$ROOT_HELPER" check 2>&1 </dev/null)
     case "$out" in ok*) printf '  Passwordless system helper: OK\n' ;; *) printf '  Passwordless system helper: MISSING (%s)\n' "$(printf '%s' "$out" | head -n 1)" ;; esac
-    if find_mole; then printf '  Mole: %s (%s)\n' "$MOLE_BIN" "$(mole_version)"; else printf '  Mole: not found (brew install mole)\n'; fi
+    if find_mole; then
+        printf '  Mole: %s (%s)' "$MOLE_BIN" "$(mole_version)"
+        out=$(mole_version_number)
+        if [ -n "$out" ] && version_lt "$out" "$MOLE_TESTED_VERSION"; then printf ' - older than the tested %s; run: macclean update' "$MOLE_TESTED_VERSION"; fi
+        printf '\n'
+    else
+        printf '  Mole: not found - run: macclean update\n'
+    fi
     if [ "$OS" = Darwin ] && launchctl print "gui/$UID_NUM/$AGENT_LABEL" >/dev/null 2>&1; then
         printf '  Background agent: loaded (%s)\n' "$AGENT_LABEL"
     else
@@ -1521,8 +1809,8 @@ run_mode_cli() { # MODE [--no-mole] [--no-system]
     cat "$REPORTS_DIR/$id.summary.txt"
 }
 
-usage() {
-    sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
+usage() { # the header comment, from line 3 to the first blank line
+    sed -n '3,/^$/p' "$0" | sed -e '/^$/d' -e 's/^# \{0,1\}//'
 }
 
 main() {
@@ -1532,6 +1820,13 @@ main() {
         scan | clean | deep-scan | deep | report | status) run_mode_cli "$cmd" "$@" ;;
         queue) cmd_queue "$@" ;;
         agent) cmd_agent ;;
+        update) cmd_update "$@" ;;
+        _ensure-mole)
+            # Installs or updates software, so only for a person at a terminal (the installer, macclean update).
+            [ -t 0 ] || { echo "macclean: run this in Terminal (it may install or update Mole)." >&2; exit 2; }
+            load_config
+            ensure_mole
+            ;;
         _ensure-whitelist) load_config; ensure_mole_whitelist ;;
         version | --version | -v) echo "MacClean $MACCLEAN_VERSION" ;;
         help | -h | --help) usage ;;

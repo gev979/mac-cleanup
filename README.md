@@ -1,8 +1,8 @@
 # mac-cleanup
 
 **MacClean**: safe, thorough, hands-off storage cleanup for macOS, built around
-[Mole](https://github.com/tw93/Mole). You install it once (your password is asked once), and then it
-cleans weekly in the background. You can also run it on demand from Terminal, Claude Code or
+[Mole](https://github.com/tw93/Mole). You install it with one command (your password is asked
+once; Mole is set up for you), and then it cleans weekly in the background. You can also run it on demand from Terminal, Claude Code or
 Claude Cowork.
 
 > Not affiliated with iMobie's "MacClean" app or with the Mole project. Mole does the heavy
@@ -50,26 +50,39 @@ Claude Cowork.
 ## Requirements
 
 - macOS on Apple Silicon (tested on macOS 27). Intel Macs should work but are untested.
-- An admin account, for the one-time password.
-- [Homebrew](https://brew.sh) and Mole: `brew install mole`. This is recommended rather than
-  required, but Mole does most of the cleaning.
+- An admin account, for the one-time password, and an internet connection during install.
+- Nothing else: no Homebrew, no git, no Xcode tools. Mole is set up for you (see below).
 
 ## Install
 
+Paste this into Terminal:
+
 ```bash
-brew install mole
-git clone https://github.com/gev979/mac-cleanup.git ~/src/mac-cleanup
-bash ~/src/mac-cleanup/install.sh
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/gev979/mac-cleanup/main/bootstrap.sh)"
 ```
 
-The installer asks for your password once. Near the end it opens **System Settings > Privacy &
-Security > Full Disk Access** and shows **MacClean Agent** in Finder: drag it into the list,
-switch it on, then press Enter in Terminal. Nothing is cleaned during install.
+It downloads the latest release, checks it, and runs the installer, which asks for your password
+once and does everything else:
+
+- **Mole is checked first, never reinstalled for nothing.** A Mole at the tested version
+  (1.73.0) or newer is left alone. An older one is updated the way it was installed: with
+  `brew upgrade mole` if it came from Homebrew, otherwise with Mole's own installer. If Mole is
+  missing, it is installed with Homebrew when you have Homebrew, otherwise with Mole's own
+  installer (Homebrew is not needed).
+- The background agent, the passwordless helper and the Claude Code skill are set up.
+- Last, it opens **System Settings > Privacy & Security > Full Disk Access** and shows **MacClean
+  Agent** in Finder: drag it into the list and switch it on. The installer notices by itself and
+  finishes. This switch is the one step macOS does not let any installer do for you.
+
+Nothing is cleaned during install. Prefer to look first? `bash bootstrap.sh --dry-run` downloads
+and checks the release without installing anything. From a clone (for development):
+`git clone https://github.com/gev979/mac-cleanup.git && bash mac-cleanup/install.sh`.
 
 It installs:
 
 | What | Where |
 |---|---|
+| Mole, only if missing or older than the tested version | Homebrew if you have it, otherwise `/usr/local/bin` (Mole's own installer) |
 | Scripts, root-owned | `/opt/macclean/bin/` (`macclean`, `macclean-root`) |
 | Command | `/usr/local/bin/macclean` |
 | Passwordless rule for the helper only | `/etc/sudoers.d/macclean` |
@@ -88,6 +101,7 @@ It installs:
 | `macclean queue deep --wait 3600` | Deep clean, see below |
 | `macclean report` | What is using space. Deletes nothing. |
 | `macclean status` | Install health, schedule, last runs |
+| `macclean update` | Update MacClean and Mole if newer versions exist (see below) |
 
 `macclean clean` also works directly. Terminal usually lacks Full Disk Access, though, so a few
 protected caches get skipped; `queue` avoids that. No command ever asks for a password.
@@ -117,11 +131,15 @@ switches, project folders searched for Playwright output, and extra protected pa
 ## Update
 
 ```bash
-cd ~/src/mac-cleanup && git pull && bash install.sh
+macclean update           # updates what is outdated, leaves the rest alone
+macclean update --check   # only looks, changes nothing
 ```
 
-Re-running the installer is safe. Your config, reports and the agent's Full Disk Access grant
-are kept.
+It checks GitHub for a newer MacClean release and checks Mole against the tested version. A newer
+MacClean is downloaded, checked and installed (your password is asked once); a Mole older than the
+tested version is updated the way it was installed. Your config, reports and the agent's Full Disk
+Access grant are kept. Nothing updates by itself in the background: a tool that deletes files
+should not change behind your back. From a clone, `git pull && bash install.sh` works too.
 
 ## Uninstall
 
@@ -130,15 +148,21 @@ bash ~/MacClean/uninstall.sh
 ```
 
 This removes the agent, `/opt/macclean`, the sudoers rule, the command link, and the Claude Code
-skill and rules. It keeps `~/MacClean` (your config and reports) and Mole's whitelist.
+skill and rules. It keeps `~/MacClean` (your config and reports), Mole and Mole's whitelist.
 
 ## Development
 
 - [`tests/`](tests/) holds fixture tests that build a fake home folder full of traps and check
-  that only intended items are removed. They run in a disposable Linux container:
+  that only intended items are removed, plus tests for `macclean update` and the Mole setup
+  against local stub releases, a stub Homebrew and a stub Mole installer. They run in a
+  disposable Linux container:
   `docker run --rm -v "$PWD":/src -w /src ubuntu:24.04 bash tests/ci.sh`
 - CI runs shellcheck, the fixture tests, and a macOS job that checks syntax with macOS's
-  bash 3.2 and does a dry-run scan with the real BSD tools.
+  bash 3.2, does a dry-run scan with the real BSD tools, and checks `bootstrap.sh --dry-run` and
+  `macclean update --check` against the real GitHub release.
+- Releasing: bump `MACCLEAN_VERSION` in `bin/macclean` (and `INSTALLER_VERSION` in `install.sh`),
+  add a `CHANGELOG.md` entry, tag `vX.Y.Z` and publish a GitHub release. `bootstrap.sh` and
+  `macclean update` refuse a release whose `MACCLEAN_VERSION` does not match its tag.
 
 ## License
 

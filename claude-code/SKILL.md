@@ -114,6 +114,9 @@ space). Quote sizes from the summary, not your own `du`. Do not paste whole logs
   Full Disk Access > enable "MacClean Agent" (in ~/Applications).
 - Note "Passwordless rule ... missing" or status shows the helper MISSING: re-run
   `bash ~/MacClean/install.sh`.
+- Status says Mole is "not found" or "older than the tested" version: run
+  `macclean update --check` to confirm, then ask the user to run `macclean update` in Terminal
+  (it may ask for their password). Do not install or upgrade Mole yourself.
 - Agent not picking up requests: in Terminal `launchctl kickstart -k gui/$(id -u)/local.macclean.agent`,
   then `macclean status`; re-running the installer reloads it.
 - Install problems: newest `~/MacClean/reports/install-*.log`.
@@ -124,23 +127,19 @@ space). Quote sizes from the summary, not your own `du`. Do not paste whole logs
 The skill works on any Mac; each Mac installs the toolkit once. Source (public):
 https://github.com/gev979/mac-cleanup - nothing in it is tied to one user or machine.
 
-1. **Mole.** Recommend `brew install mole` first. MacClean works without it, but Mole does most
-   of the cleaning.
-2. **Get the files.**
-   - Native shell (Claude Code), with the user's OK:
-     `git clone https://github.com/gev979/mac-cleanup.git ~/src/mac-cleanup`
-     (or `git -C ~/src/mac-cleanup pull` if it is already there).
-   - Cowork: clone the repo in the cloud workspace (`git clone --depth 1 <url> /tmp/mac-cleanup`;
-     if that host is blocked, ask the user to run the clone in Terminal instead). `~/MacClean` may
-     not exist yet, so request access to the home folder (`["~"]`, reason "Create the ~/MacClean
-     cleanup toolkit folder"), then `device_commit_files` these files to the same paths under
-     `~/MacClean/`: `install.sh`, `uninstall.sh`, `config.default`, `README.md`, `bin/macclean`,
-     `bin/macclean-root`, `claude-code/SKILL.md`. Never overwrite an existing `~/MacClean/config`.
-3. **Install - only the user can do this** (it needs their password): in Terminal,
-   `bash ~/src/mac-cleanup/install.sh` (or `bash ~/MacClean/install.sh` for the Cowork route).
-   Near the end the user switches on "MacClean Agent" under Full Disk Access and presses Enter.
-4. **Verify.** `~/MacClean/.state/installed` exists; read the newest
-   `~/MacClean/reports/install-*.log` and check for "verified without a password" and "Full Disk
-   Access confirmed". Then do the first `scan`, show it, and run `clean` only after the user's OK.
-5. **Updates:** `cd <source> && git pull && bash install.sh`, where `<source>` is the `source=`
-   path in `~/MacClean/.state/installed`. Config, reports and the Full Disk Access grant are kept.
+1. **Install - only the user can do this** (it needs their password). Give them this one line
+   to paste into Terminal:
+   `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/gev979/mac-cleanup/main/bootstrap.sh)"`
+   It downloads the latest release and sets up everything, Mole included: a current Mole is kept,
+   an older one is updated the way it was installed, a missing one is installed (Homebrew is not
+   needed). Do not install Mole, Homebrew or git, or clone the repo, beforehand. At the end the
+   user drags "MacClean Agent" into Full Disk Access and switches it on; the installer notices by
+   itself.
+2. **Verify.** `~/MacClean/.state/installed` exists; read the newest
+   `~/MacClean/reports/install-*.log` and check for "helper verified without a password", "Mole
+   is ready" and "Full Disk Access confirmed". Then do the first `scan`, show it, and run `clean`
+   only after the user's OK.
+3. **Updates:** `macclean update --check` is safe to run yourself (it changes nothing) and says
+   whether MacClean or Mole is outdated. The update itself, `macclean update`, must run in the
+   user's Terminal because it may ask for their password. Config, reports and the Full Disk
+   Access grant are kept.
