@@ -1,0 +1,39 @@
+# MacClean settings - KEY=VALUE, one per line, '#' starts a comment.
+# This file is read (never executed). Invalid values fall back to the defaults.
+
+# --- Schedule (background agent) --------------------------------------------
+SCHEDULE=weekly            # weekly | daily | off
+IDLE_MINUTES=10            # scheduled run waits until the Mac has been idle this long
+NOTIFY=1                   # macOS notification after a scheduled run
+
+# --- What a normal run ("clean") does ------------------------------------------
+USE_MOLE=1                 # run `mo clean` (user level) as part of every clean
+SYSTEM_CLEAN=1             # run the fixed-action root helper (old system logs, crash dumps...)
+PROTECT_TRASH=1            # keep ~/.Trash in Mole's whitelist so Mole never empties it
+TMP_MAX_AGE_DAYS=7         # stray files in your temp folder older than this are removed
+PLAYWRIGHT_OUTPUT_MAX_AGE_DAYS=3   # Playwright MCP screenshots (.playwright-mcp, temp output)
+PLAYWRIGHT_PRUNE_OLD_BROWSERS=1    # remove old ms-playwright revisions nothing installed needs
+NPX_MAX_AGE_DAYS=14        # npx packages untouched this long and not running are removed
+CLAUDE_DEBUG_MAX_AGE_DAYS=7        # ~/.claude*/debug and shell-snapshots files older than this
+CLAUDE_DESKTOP_CACHES=1    # Claude desktop browser caches, only while the app is closed
+
+# Folders searched for .playwright-mcp / test-results / playwright-report (colon-separated,
+# must be inside your home; Documents/Desktop/Downloads are never searched).
+PROJECT_ROOTS=~/Projects:~/CascadeProjects:~/DataGripProjects:~/Developer:~/dev:~/code:~/src:~/work:~/repos:~/GitHub:~/Sites:~/workspace
+
+# Extra paths MacClean must never delete (colon-separated). Mole has its own list:
+# ~/.config/mole/whitelist
+EXTRA_PROTECT=
+
+# --- Deep clean only (runs only when you ask for "deep") ----------------------
+DEEP_DOCKER=1              # prune unused Docker images + old build cache
+DOCKER_IMAGE_MIN_AGE_DAYS=30
+DEEP_MOLE_PURGE=1          # `mo purge --yes`: node_modules/build folders in projects idle 7+ days
+DEEP_TRASH=1               # empty items that have been in the Trash for TRASH_MIN_AGE_DAYS
+TRASH_MIN_AGE_DAYS=7
+DEEP_PUPPETEER=1           # old Puppeteer browser versions (newest kept)
+DEEP_TM_SNAPSHOTS=1        # Time Machine LOCAL snapshots older than 24h
+
+# --- Reports -------------------------------------------------------------------
+KEEP_REPORTS=60            # run logs kept in ~/MacClean/reports
+BIG_ITEM_MIN_MB=500        # size threshold for the "large items left alone" list

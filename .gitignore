@@ -1,0 +1,10 @@
+# Runtime state, in case the repo itself is used as ~/MacClean
+/queue/
+/reports/
+/tmp/
+/.state/
+# Your personal settings (created from config.default by the installer)
+/config
+# Local planning notes for Claude Code
+/IMPLEMENTATION_PLAN.md
+.DS_Store

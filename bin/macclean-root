@@ -1,0 +1,138 @@
+#!/bin/bash
+#
+# macclean-root - fixed-action system-level cleanup helper for MacClean.
+#
+# Installed root-owned at /opt/macclean/bin/macclean-root. /etc/sudoers.d/macclean lets
+# your user run it WITHOUT a password, but only with exactly one of these arguments:
+#
+#     check | scan | clean | deep-scan | deep
+#
+# It accepts no paths or options, reads no user-writable files, only ever removes
+# regular files (never folders), never crosses into other volumes, and skips
+# anything that is open. scan / deep-scan only measure.
+#
+# What it cleans (all regenerable, mirrored from Mole's audited system-level rules):
+#   - crash reports in /Library/Logs/DiagnosticReports older than 7 days
+#   - rotated/compressed system logs in /private/var/log older than 7 days,
+#     stale *.log files there older than 14 days
+#   - third-party logs in /Library/Logs older than 30 days
+#   - *.cache / *.log leftovers in /Library/Caches older than 7 days
+#   - unified-log archive chunks (*.tracev3) in /private/var/db/diagnostics older than 7 days
+#   - memory-limit exception reports older than 30 days
+#   - core dumps in /cores older than 1 day
+#   - aborted wallpaper/aerial downloads (CFNetworkDownload_*.tmp) untouched for 1 hour
+#   deep only:
+#   - Time Machine LOCAL snapshots older than 24 hours (never the backup disk)
+
+VERSION="1.0.0"
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+IFS='
+'
+umask 077
+cd / || exit 1
+
+if [ "$(/usr/bin/id -u)" != 0 ]; then
+    echo "macclean-root: must run as root (via sudo)" >&2
+    exit 2
+fi
+if [ $# -ne 1 ]; then
+    echo "usage: macclean-root check|scan|clean|deep-scan|deep" >&2
+    exit 2
+fi
+MODE=$1
+case "$MODE" in
+    check | scan | clean | deep-scan | deep) ;;
+    *) echo "macclean-root: invalid mode" >&2; exit 2 ;;
+esac
+if [ "$MODE" = check ]; then
+    echo "ok macclean-root $VERSION"
+    exit 0
+fi
+
+DRY=1
+case "$MODE" in clean | deep) DRY=0 ;; esac
+DEEP=0
+case "$MODE" in deep | deep-scan) DEEP=1 ;; esac
+TOTAL_KB=0
+TOTAL_N=0
+TAB=$(printf '\t')
+
+# clean_files CATEGORY BASE MAXDEPTH AGE_OP AGE_VALUE CHECK_OPEN PATTERN...
+#   AGE_OP is -mtime or -mmin, AGE_VALUE like +7 ; CHECK_OPEN 1 = skip open files
+clean_files() {
+    local cat="$1" base="$2" depth="$3" aop="$4" aval="$5" check_open="$6"
+    shift 6
+    local kb=0 n=0 f s first=1 pat
+    [ -d "$base" ] || return 0
+    if [ -L "$base" ]; then
+        echo "NOTE skipped symlinked $base"
+        return 0
+    fi
+    local expr=()
+    for pat in "$@"; do
+        if [ "$first" = 1 ]; then
+            expr=(-name "$pat")
+            first=0
+        else
+            expr=("${expr[@]}" -o -name "$pat")
+        fi
+    done
+    while IFS= read -r -d '' f; do
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
+        s=$(du -k "$f" 2>/dev/null | awk 'NR == 1 {print $1 + 0}')
+        [ -n "$s" ] || s=0
+        if [ "$check_open" = 1 ] && lsof -t -- "$f" >/dev/null 2>&1; then
+            continue
+        fi
+        if [ "$DRY" = 0 ]; then
+            rm -f -- "$f" 2>/dev/null || continue
+            [ -e "$f" ] && continue
+        fi
+        kb=$((kb + s))
+        n=$((n + 1))
+    done < <(find "$base" -xdev -maxdepth "$depth" -type f \( "${expr[@]}" \) "$aop" "$aval" -print0 2>/dev/null)
+    TOTAL_KB=$((TOTAL_KB + kb))
+    TOTAL_N=$((TOTAL_N + n))
+    printf 'ROOT_ITEM%s%s%s%s%s%s\n' "$TAB" "$cat" "$TAB" "$kb" "$TAB" "$n"
+}
+
+clean_files "Crash reports (system)" /Library/Logs/DiagnosticReports 3 -mtime +7 0 '*'
+clean_files "Rotated system logs" /private/var/log 3 -mtime +7 0 '*.gz' '*.bz2' '*.[0-9]' '*.asl'
+clean_files "Stale system logs" /private/var/log 3 -mtime +14 0 '*.log' '*.log.*'
+clean_files "Old third-party logs (/Library/Logs)" /Library/Logs 3 -mtime +30 0 '*.log' '*.log.*' '*.gz'
+clean_files "System cache leftovers (/Library/Caches)" /Library/Caches 5 -mtime +7 0 '*.cache' '*.log'
+clean_files "Old unified-log chunks" /private/var/db/diagnostics 3 -mtime +7 0 '*.tracev3'
+clean_files "Memory exception reports" /private/var/db/reportmemoryexception/MemoryLimitViolations 2 -mtime +30 0 '*'
+clean_files "Core dumps" /cores 1 -mtime +0 1 'core.*'
+
+# Aborted wallpaper/aerial downloads live in com.apple.idleassetsd's root-owned temp dir.
+while IFS= read -r -d '' d; do
+    clean_files "Aborted wallpaper downloads" "$d" 3 -mmin +60 1 'CFNetworkDownload_*.tmp'
+done < <(find /private/var/folders -xdev -maxdepth 5 -type d -name com.apple.idleassetsd -print0 2>/dev/null)
+
+if [ "$DEEP" = 1 ] && command -v tmutil >/dev/null 2>&1; then
+    if tmutil status 2>/dev/null | grep -q 'Running = 1;'; then
+        echo "NOTE Time Machine is backing up right now, local snapshots were kept."
+    else
+        now=$(date +%s)
+        n=0
+        while IFS= read -r d; do
+            case "$d" in
+                [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+                *) continue ;;
+            esac
+            ep=$(date -j -f '%Y-%m-%d-%H%M%S' "$d" +%s 2>/dev/null) || continue
+            [ $((now - ep)) -ge 86400 ] || continue
+            if [ "$DRY" = 0 ]; then
+                tmutil deletelocalsnapshots "$d" >/dev/null 2>&1 && n=$((n + 1))
+            else
+                n=$((n + 1))
+            fi
+        done < <(tmutil listlocalsnapshotdates / 2>/dev/null)
+        printf 'ROOT_ITEM%sTime Machine local snapshots older than 24h%s0%s%s\n' "$TAB" "$TAB" "$TAB" "$n"
+    fi
+fi
+
+printf 'ROOT_TOTAL%s%s%s%s\n' "$TAB" "$TOTAL_KB" "$TAB" "$TOTAL_N"
+exit 0

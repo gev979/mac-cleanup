@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-fixtures:
+    name: Fixture tests (disposable Linux container)
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck, syntax and fixture tests
+        run: bash tests/ci.sh
+
+  macos-smoke:
+    name: macOS bash 3.2 + BSD tools smoke test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check with macOS /bin/bash (3.2)
+        run: |
+          /bin/bash --version | head -n 1
+          for f in bin/macclean bin/macclean-root install.sh uninstall.sh; do /bin/bash -n "$f"; done
+      - name: Dry-run scan (deletes nothing; no Mole, no root helper)
+        run: |
+          export MACCLEAN_HOME="$RUNNER_TEMP/macclean"
+          /bin/bash bin/macclean version
+          /bin/bash bin/macclean scan --no-mole --no-system
+          /bin/bash bin/macclean deep-scan --no-mole --no-system
+          grep -h '^RESULT' "$MACCLEAN_HOME"/reports/*.summary.txt

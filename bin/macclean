@@ -1,0 +1,1542 @@
+#!/bin/bash
+# shellcheck disable=SC2088  # literal '~' is intentional (display / manual expansion)
+#
+# MacClean - safe, thorough macOS storage cleanup built around Mole
+#            (https://github.com/tw93/Mole) plus extra, carefully guarded targets:
+#            Playwright/Puppeteer leftovers, temp junk, Claude Code debris, stale
+#            npx packages, and old system logs via a fixed-action root helper.
+#
+#   macclean scan          preview the normal (balanced) clean - deletes nothing
+#   macclean clean         run the normal clean
+#   macclean deep-scan     preview the deep clean - deletes nothing
+#   macclean deep          deep clean: normal clean + unused Docker images, idle
+#                          project build folders (mo purge), Trash items 7+ days
+#                          old, old Puppeteer browsers, Time Machine local snapshots
+#   macclean report        what is using space (sizes only, deletes nothing)
+#   macclean status        installation health, schedule, last runs
+#   macclean queue MODE [--wait SECONDS]
+#                          ask the background agent (which has Full Disk Access)
+#                          to run MODE; optionally wait and print the summary
+#   macclean agent         entry point for the launchd agent (queue + schedule)
+#
+# Safety model: every deletion goes through safe_delete(), which refuses unless the
+# path is absolute, inside an explicit allowed root, outside every protected tree,
+# owned by you, not a mount point, not open by any process (lsof), not on any running
+# command line (ps), and contains no sockets. Temporary items also need an age
+# threshold. scan / deep-scan / report / status never delete anything.
+
+MACCLEAN_VERSION="1.0.0"
+
+umask 022
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:${HOME:-/nonexistent}/.local/bin:${HOME:-/nonexistent}/.orbstack/bin:${HOME:-/nonexistent}/.docker/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+set -u
+
+if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then echo "macclean: HOME is not set" >&2; exit 2; fi
+HOME=$(cd -P "$HOME" && pwd -P)
+case "$HOME" in "/"|"") echo "macclean: refusing to run with HOME=/" >&2; exit 2 ;; esac
+
+OS=$(uname -s)
+UID_NUM=$(id -u)
+if [ "$UID_NUM" -eq 0 ] && [ "${MACCLEAN_ALLOW_ROOT:-0}" != 1 ]; then
+    echo "macclean: run as your normal user (system parts use the passwordless helper)." >&2
+    exit 2
+fi
+
+MC_HOME="${MACCLEAN_HOME:-$HOME/MacClean}"
+CONFIG_FILE="$MC_HOME/config"
+QUEUE_DIR="$MC_HOME/queue"
+REPORTS_DIR="$MC_HOME/reports"
+INBOX_TMP="$MC_HOME/tmp"
+STATE_DIR="$MC_HOME/.state"
+ROOT_HELPER="${MACCLEAN_ROOT_HELPER:-/opt/macclean/bin/macclean-root}"
+AGENT_LABEL="local.macclean.agent"
+AGENT_APP="$HOME/Applications/MacClean Agent.app"
+MOLE_WL="$HOME/.config/mole/whitelist"
+TAB=$(printf '\t')
+NL='
+'
+ESC=$(printf '\033')
+
+IN_AGENT=0
+DRY_RUN=1
+LOG_FILE=""
+RUN_DIR=""
+SUMMARY_FILE=""
+LOCK_HELD=0
+LSOF_OK=0
+LSOF_FILE=/dev/null
+PS_FILE=/dev/null
+HAS_FDA=unknown
+MOLE_BIN=""
+MOLE_SUMMARY=""
+MOLE_PURGE_SUMMARY=""
+DOCKER_SUMMARY=""
+ROOT_KB=0
+ROOT_N=0
+ROOT_LINES=""
+ROOT_RAN=0
+FREE_BEFORE=""
+RUN_MODE=""
+RUN_ID=""
+CLAUDE_DIRS=""
+PROJECT_DIRS=""
+PROTECT_EXACT=""
+PROTECT_TREE=""
+ALLOWED_ROOTS=""
+ACTIONS=/dev/null
+NOTES=/dev/null
+BIG=/dev/null
+
+# ----------------------------------------------------------------------------
+# Platform helpers (macOS/BSD first; GNU fallbacks only exist for the test suite)
+# ----------------------------------------------------------------------------
+if [ "$OS" = Darwin ]; then
+    file_uid() { stat -f %u "$1" 2>/dev/null; }
+    file_dev() { stat -f %d "$1" 2>/dev/null; }
+    rm_tree() { rm -rfx -- "$1"; }
+    fmt_epoch() { date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null; }
+else
+    file_uid() { stat -c %u "$1" 2>/dev/null; }
+    file_dev() { stat -c %d "$1" 2>/dev/null; }
+    rm_tree() { rm -rf --one-file-system -- "$1"; }
+    fmt_epoch() { date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null; }
+fi
+
+# run_timeout SECONDS CMD... : run CMD, kill it if it runs longer than SECONDS.
+run_timeout() {
+    local secs="$1"
+    shift
+    "$@" &
+    local pid=$!
+    (
+        n=0
+        while kill -0 "$pid" 2>/dev/null; do
+            if [ "$n" -ge "$secs" ]; then
+                kill -TERM "$pid" 2>/dev/null
+                sleep 3
+                kill -KILL "$pid" 2>/dev/null
+                exit 0
+            fi
+            sleep 1
+            n=$((n + 1))
+        done
+    ) >/dev/null 2>&1 &
+    local watcher=$!
+    wait "$pid"
+    local rc=$?
+    kill "$watcher" 2>/dev/null
+    wait "$watcher" 2>/dev/null
+    return "$rc"
+}
+
+user_tmp_dir() {
+    local t=""
+    if [ -n "${MACCLEAN_TMPDIR:-}" ]; then
+        t="$MACCLEAN_TMPDIR"
+    elif [ "$OS" = Darwin ]; then
+        t=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)
+    fi
+    [ -n "$t" ] || t="${TMPDIR:-}"
+    [ -n "$t" ] || return 0
+    (cd -P "$t" 2>/dev/null && pwd -P)
+}
+
+TMPD=$(user_tmp_dir)
+case "$TMPD" in "/" | "$HOME") TMPD="" ;; esac
+if [ -n "${MACCLEAN_SYSTMP:-}" ]; then
+    SYSTMP=$(cd -P "$MACCLEAN_SYSTMP" 2>/dev/null && pwd -P)
+elif [ -d /private/tmp ]; then
+    SYSTMP=/private/tmp
+else
+    SYSTMP=""
+fi
+[ "$SYSTMP" = "$TMPD" ] && SYSTMP=""
+
+DATA_VOL=/
+[ -d /System/Volumes/Data ] && DATA_VOL=/System/Volumes/Data
+free_kb() { df -Pk "$DATA_VOL" 2>/dev/null | awk 'NR==2 {print $4+0}'; }
+
+human_kb() {
+    awk -v k="${1:-0}" 'BEGIN {
+        b = k * 1024; split("B KB MB GB TB", u, " "); i = 1
+        while (b >= 1000 && i < 5) { b /= 1000; i++ }
+        if (i <= 2) printf "%d %s", b, u[i]; else printf "%.1f %s", b, u[i]
+    }'
+}
+
+tildify() {
+    case "$1" in
+        "$HOME") printf '~' ;;
+        "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+expand_tilde() {
+    case "$1" in
+        "~") printf '%s' "$HOME" ;;
+        "~/"*) printf '%s/%s' "$HOME" "${1#\~/}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+is_int() { case "${1:-}" in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+# ----------------------------------------------------------------------------
+# Configuration (~/MacClean/config, KEY=VALUE; parsed, never sourced)
+# ----------------------------------------------------------------------------
+cfg_defaults() {
+    SCHEDULE=weekly
+    IDLE_MINUTES=10
+    USE_MOLE=1
+    SYSTEM_CLEAN=1
+    PROTECT_TRASH=1
+    TMP_MAX_AGE_DAYS=7
+    PLAYWRIGHT_OUTPUT_MAX_AGE_DAYS=3
+    PLAYWRIGHT_PRUNE_OLD_BROWSERS=1
+    NPX_MAX_AGE_DAYS=14
+    CLAUDE_DEBUG_MAX_AGE_DAYS=7
+    CLAUDE_DESKTOP_CACHES=1
+    DEEP_DOCKER=1
+    DOCKER_IMAGE_MIN_AGE_DAYS=30
+    DEEP_MOLE_PURGE=1
+    DEEP_TRASH=1
+    TRASH_MIN_AGE_DAYS=7
+    DEEP_PUPPETEER=1
+    DEEP_TM_SNAPSHOTS=1
+    PROJECT_ROOTS="~/Projects:~/CascadeProjects:~/DataGripProjects:~/Developer:~/dev:~/code:~/src:~/work:~/repos:~/GitHub:~/Sites:~/workspace"
+    EXTRA_PROTECT=""
+    NOTIFY=1
+    KEEP_REPORTS=60
+    BIG_ITEM_MIN_MB=500
+}
+
+cfg_int() {
+    is_int "$2" || return 0
+    [ "${#2}" -le 9 ] || return 0
+    if [ "$2" -ge "$3" ] && [ "$2" -le "$4" ]; then eval "$1=\$2"; fi
+}
+
+cfg_bool() {
+    case "$2" in
+        1 | yes | true | on) eval "$1=1" ;;
+        0 | no | false | off) eval "$1=0" ;;
+    esac
+}
+
+load_config() {
+    cfg_defaults
+    [ -f "$CONFIG_FILE" ] || return 0
+    local line key val
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in '' | '#'*) continue ;; esac
+        case "$line" in *=*) ;; *) continue ;; esac
+        key=${line%%=*}
+        val=${line#*=}
+        key=$(printf '%s' "$key" | tr -d ' \t\r')
+        val=${val%%#*}
+        val=$(printf '%s' "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\\(.*\\)'\$/\\1/")
+        case "$key" in
+            SCHEDULE) case "$val" in weekly | daily | off) SCHEDULE=$val ;; esac ;;
+            IDLE_MINUTES) cfg_int IDLE_MINUTES "$val" 0 1440 ;;
+            TMP_MAX_AGE_DAYS) cfg_int TMP_MAX_AGE_DAYS "$val" 2 3650 ;;
+            PLAYWRIGHT_OUTPUT_MAX_AGE_DAYS) cfg_int PLAYWRIGHT_OUTPUT_MAX_AGE_DAYS "$val" 1 3650 ;;
+            NPX_MAX_AGE_DAYS) cfg_int NPX_MAX_AGE_DAYS "$val" 3 3650 ;;
+            CLAUDE_DEBUG_MAX_AGE_DAYS) cfg_int CLAUDE_DEBUG_MAX_AGE_DAYS "$val" 1 3650 ;;
+            DOCKER_IMAGE_MIN_AGE_DAYS) cfg_int DOCKER_IMAGE_MIN_AGE_DAYS "$val" 1 3650 ;;
+            TRASH_MIN_AGE_DAYS) cfg_int TRASH_MIN_AGE_DAYS "$val" 0 3650 ;;
+            KEEP_REPORTS) cfg_int KEEP_REPORTS "$val" 5 1000 ;;
+            BIG_ITEM_MIN_MB) cfg_int BIG_ITEM_MIN_MB "$val" 50 10000000 ;;
+            USE_MOLE | SYSTEM_CLEAN | PROTECT_TRASH | PLAYWRIGHT_PRUNE_OLD_BROWSERS | CLAUDE_DESKTOP_CACHES | DEEP_DOCKER | DEEP_MOLE_PURGE | DEEP_TRASH | DEEP_PUPPETEER | DEEP_TM_SNAPSHOTS | NOTIFY)
+                cfg_bool "$key" "$val" ;;
+            PROJECT_ROOTS) PROJECT_ROOTS=$val ;;
+            EXTRA_PROTECT) EXTRA_PROTECT=$val ;;
+        esac
+    done <"$CONFIG_FILE"
+}
+
+# ----------------------------------------------------------------------------
+# Output and bookkeeping
+# ----------------------------------------------------------------------------
+say() {
+    printf '%s\n' "$*"
+    if [ -n "$LOG_FILE" ]; then printf '%s\n' "$*" >>"$LOG_FILE"; fi
+}
+logq() { if [ -n "$LOG_FILE" ]; then printf '%s\n' "$*" >>"$LOG_FILE"; fi; }
+note() {
+    printf '%s\n' "$*" >>"$NOTES"
+    logq "NOTE: $*"
+}
+record() { # ACTION CATEGORY KB PATH
+    printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >>"$ACTIONS"
+    logq "$(printf '%-5s %10s KB  [%s] %s' "$1" "$3" "$2" "$4")"
+}
+skip() { # REASON PATH
+    printf 'SKIP\t%s\t0\t%s\n' "$1" "$2" >>"$ACTIONS"
+    logq "SKIP  ($1) $2"
+}
+clean_output() { tr '\r' '\n' <"$1" | sed "s/${ESC}\\[[0-9;?]*[A-Za-z]//g"; }
+
+# ----------------------------------------------------------------------------
+# Safety lists
+# ----------------------------------------------------------------------------
+discover_claude_dirs() {
+    CLAUDE_DIRS=""
+    local d
+    for d in "$HOME/.claude" "$HOME"/.claude-*; do
+        [ -d "$d" ] && [ ! -L "$d" ] || continue
+        case "${d##*/}" in .claude-mem) continue ;; esac
+        if [ -d "$d/projects" ] || [ -d "$d/shell-snapshots" ] || [ -f "$d/settings.json" ]; then
+            CLAUDE_DIRS="$CLAUDE_DIRS$d$NL"
+        fi
+    done
+}
+
+discover_project_roots() {
+    PROJECT_DIRS=""
+    local r real
+    while IFS= read -r r; do
+        [ -n "$r" ] || continue
+        r=$(expand_tilde "$r")
+        case "$r" in "$HOME"/?*) ;; *) continue ;; esac
+        case "$r" in "$HOME/Documents"* | "$HOME/Desktop"* | "$HOME/Downloads"* | "$HOME/Library"*) continue ;; esac
+        [ -d "$r" ] && [ ! -L "$r" ] || continue
+        real=$(cd -P "$r" 2>/dev/null && pwd -P) || continue
+        case "$real" in "$HOME"/?*) ;; *) continue ;; esac
+        PROJECT_DIRS="$PROJECT_DIRS$real$NL"
+    done <<EOF
+$(printf '%s' "$PROJECT_ROOTS" | tr ':' '\n')
+EOF
+}
+
+build_safety_lists() {
+    local r d sub
+    PROTECT_EXACT="/$NL$HOME$NL$HOME/Library$NL$HOME/Library/Caches$NL$HOME/Library/Logs$NL$HOME/Library/Application Support$NL$HOME/.cache$NL$HOME/.npm$NL$HOME/.nvm$NL$HOME/.Trash$NL$MC_HOME$NL"
+    [ -n "$TMPD" ] && PROTECT_EXACT="$PROTECT_EXACT$TMPD$NL"
+    [ -n "$SYSTMP" ] && PROTECT_EXACT="$PROTECT_EXACT$SYSTMP$NL"
+
+    PROTECT_TREE=""
+    for r in "Library/Keychains" "Library/Mail" "Library/Messages" "Library/Accounts" "Library/Calendars" \
+        "Library/Contacts" "Library/Cookies" "Library/Preferences" "Library/Mobile Documents" "Library/CloudStorage" \
+        "Library/Containers" "Library/Group Containers" "Library/Safari" "Library/Photos" \
+        "Library/Application Support/MobileSync" \
+        "Library/Application Support/Claude/vm_bundles" "Library/Application Support/Claude/Claude Extensions" \
+        "Library/Application Support/Claude/Claude Extensions Settings" \
+        "Library/Application Support/Claude/claude_desktop_config.json" "Library/Application Support/Claude/Local Storage" \
+        "Library/Application Support/Claude/IndexedDB" "Library/Application Support/Claude/Session Storage" \
+        "Library/Application Support/Claude/local-agent-mode-sessions" \
+        "Documents" "Desktop" "Downloads" "Pictures" "Movies" "Music" "Public" \
+        ".ssh" ".gnupg" ".aws" ".azure" ".kube" ".docker" ".config" ".local/share" ".claude-mem" ".claude.json" \
+        ".gitconfig" ".zshrc" ".zprofile" ".bashrc" ".bash_profile" ".npmrc" ".netrc" ".yarn/berry" ".ollama" \
+        ".cache/huggingface" ".cache/lm-studio" ".lmstudio" "MacClean/config"; do
+        PROTECT_TREE="$PROTECT_TREE$HOME/$r$NL"
+    done
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        for r in projects file-history history.jsonl settings.json settings.local.json skills plugins agents \
+            commands hooks CLAUDE.md .credentials.json plans ide; do
+            PROTECT_TREE="$PROTECT_TREE$d/$r$NL"
+        done
+    done <<EOF
+$CLAUDE_DIRS
+EOF
+    while IFS= read -r r; do
+        [ -n "$r" ] || continue
+        r=$(expand_tilde "$r")
+        case "$r" in /*) PROTECT_TREE="$PROTECT_TREE${r%/}$NL" ;; esac
+    done <<EOF
+$(printf '%s' "$EXTRA_PROTECT" | tr ':' '\n')
+EOF
+
+    ALLOWED_ROOTS="TREE:$HOME/Library/Caches/ms-playwright${NL}TREE:$HOME/.cache/puppeteer${NL}TREE:$HOME/.npm/_npx$NL"
+    ALLOWED_ROOTS="${ALLOWED_ROOTS}TREE:$HOME/.nvm/.cache${NL}TREE:$HOME/.thumbnails${NL}TREE:$HOME/.playwright-mcp${NL}TREE:$HOME/.Trash$NL"
+    ALLOWED_ROOTS="${ALLOWED_ROOTS}TREE:$HOME/.npm/_libvips$NL"
+    [ -n "$TMPD" ] && ALLOWED_ROOTS="${ALLOWED_ROOTS}TREE:$TMPD$NL"
+    [ -n "$SYSTMP" ] && ALLOWED_ROOTS="${ALLOWED_ROOTS}TREE:$SYSTMP$NL"
+    for sub in "Cache" "Code Cache" "GPUCache" "DawnGraphiteCache" "DawnWebGPUCache"; do
+        ALLOWED_ROOTS="${ALLOWED_ROOTS}TREE:$HOME/Library/Application Support/Claude/$sub$NL"
+    done
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        ALLOWED_ROOTS="${ALLOWED_ROOTS}TREE:$d/debug${NL}TREE:$d/shell-snapshots${NL}TREE:$d/todos$NL"
+    done <<EOF
+$CLAUDE_DIRS
+EOF
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        ALLOWED_ROOTS="${ALLOWED_ROOTS}PROJ:$d$NL"
+    done <<EOF
+$PROJECT_DIRS
+EOF
+}
+
+# Refuse a path that is protected, inside a protected tree, or an ancestor of either.
+# (Lists are newline-separated; word splitting on newlines with globbing off.)
+is_protected() {
+    local p="$1" q rc=1
+    local IFS="$NL"
+    set -f
+    for q in $PROTECT_EXACT; do
+        if [ "$p" = "$q" ]; then rc=0; break; fi
+        case "$q" in "$p"/*) rc=0; break ;; esac
+    done
+    if [ "$rc" = 1 ]; then
+        for q in $PROTECT_TREE; do
+            case "$p" in "$q" | "$q"/*) rc=0; break ;; esac
+            case "$q" in "$p"/*) rc=0; break ;; esac
+        done
+    fi
+    set +f
+    return "$rc"
+}
+
+under_allowed_root() {
+    local p="$1" entry kind root rc=1
+    local IFS="$NL"
+    set -f
+    for entry in $ALLOWED_ROOTS; do
+        kind=${entry%%:*}
+        root=${entry#*:}
+        case "$p" in
+            "$root"/?*)
+                if [ "$kind" = PROJ ]; then
+                    case "$p" in */.playwright-mcp/?* | */test-results | */playwright-report) rc=0; break ;; esac
+                else
+                    rc=0
+                    break
+                fi
+                ;;
+        esac
+    done
+    set +f
+    return "$rc"
+}
+
+# ----------------------------------------------------------------------------
+# In-use detection (one lsof + ps snapshot per run)
+# ----------------------------------------------------------------------------
+snapshot_processes() {
+    LSOF_FILE="$RUN_DIR/open-files.txt"
+    PS_FILE="$RUN_DIR/processes.txt"
+    LSOF_OK=0
+    : >"$LSOF_FILE"
+    : >"$PS_FILE"
+    ps -A -ww -o command= >"$PS_FILE" 2>/dev/null
+    if command -v lsof >/dev/null 2>&1; then
+        run_timeout 120 lsof -nP -w -u "$UID_NUM" -F n >"$RUN_DIR/lsof.raw" 2>/dev/null
+        local rc=$?
+        # lsof exits 1 when a few files could not be inspected; the listing is still valid.
+        if { [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; } && [ -s "$RUN_DIR/lsof.raw" ]; then
+            LSOF_OK=1
+            sed -n 's/^n//p' "$RUN_DIR/lsof.raw" |
+                grep -F -e "$HOME/" -e "/private/var/folders/" -e "/var/folders/" -e "/private/tmp/" -e "/tmp/" >"$LSOF_FILE" 2>/dev/null
+        fi
+        rm -f -- "$RUN_DIR/lsof.raw"
+    fi
+    [ "$LSOF_OK" = 1 ] || note "Open-file check (lsof) unavailable, so nothing that needs it was deleted."
+}
+
+alt_path() {
+    case "$1" in
+        /private/var/* | /private/tmp/*) printf '%s' "${1#/private}" ;;
+        /var/* | /tmp/*) printf '/private%s' "$1" ;;
+    esac
+}
+
+path_in_use() {
+    local a
+    a=$(alt_path "$1")
+    P="$1" A="$a" awk 'BEGIN { p = ENVIRON["P"]; a = ENVIRON["A"]; lp = length(p); la = length(a) }
+        $0 == p || substr($0, 1, lp + 1) == p "/" { found = 1; exit }
+        a != "" && ($0 == a || substr($0, 1, la + 1) == a "/") { found = 1; exit }
+        END { exit !found }' "$LSOF_FILE"
+}
+
+path_in_ps() {
+    local a
+    a=$(alt_path "$1")
+    grep -F -q -e "$1" "$PS_FILE" && return 0
+    if [ -n "$a" ]; then grep -F -q -e "$a" "$PS_FILE" && return 0; fi
+    return 1
+}
+
+has_socket() { [ -n "$(find "$1" -xdev -type s -print 2>/dev/null | head -n 1)" ]; }
+
+recently_modified() { # PATH MINUTES -> true if PATH or anything below it changed recently
+    [ -n "$(find "$1" -xdev -mmin -"$2" -print 2>/dev/null | head -n 1)" ]
+}
+
+size_kb() {
+    local k
+    k=$(du -skx "$1" 2>/dev/null | awk 'NR == 1 {print $1 + 0}')
+    printf '%s' "${k:-0}"
+}
+
+# ----------------------------------------------------------------------------
+# The single deletion gate
+# ----------------------------------------------------------------------------
+safe_delete() { # CATEGORY PATH
+    local cat="$1" p="$2" parent kb
+    case "$p" in /*) ;; *) skip "not-absolute" "$p"; return 1 ;; esac
+    case "$p" in */ | */./* | */../* | */. | */.. | *//*) skip "unnormalized-path" "$p"; return 1 ;; esac
+    [ -e "$p" ] || [ -L "$p" ] || return 1
+    if is_protected "$p"; then skip "protected" "$p"; return 1; fi
+    if ! under_allowed_root "$p"; then skip "outside-allowed-roots" "$p"; return 1; fi
+    if [ "$(file_uid "$p")" != "$UID_NUM" ]; then skip "not-owned-by-you" "$p"; return 1; fi
+    if [ -S "$p" ] || [ -p "$p" ]; then skip "socket-or-fifo" "$p"; return 1; fi
+    parent=${p%/*}
+    [ -n "$parent" ] || parent=/
+    if [ ! -L "$p" ] && [ "$(file_dev "$p")" != "$(file_dev "$parent")" ]; then skip "mount-point" "$p"; return 1; fi
+    if [ "$LSOF_OK" != 1 ]; then skip "open-file-check-unavailable" "$p"; return 1; fi
+    if path_in_use "$p"; then skip "in-use(open file)" "$p"; return 1; fi
+    if path_in_ps "$p"; then skip "in-use(running process)" "$p"; return 1; fi
+    if [ -d "$p" ] && [ ! -L "$p" ] && has_socket "$p"; then skip "contains-socket" "$p"; return 1; fi
+    kb=$(size_kb "$p")
+    if [ "$DRY_RUN" = 1 ]; then
+        record WOULD "$cat" "$kb" "$p"
+        return 0
+    fi
+    if [ -d "$p" ] && [ ! -L "$p" ]; then
+        rm_tree "$p" 2>>"$RUN_DIR/errors.txt"
+    else
+        rm -f -- "$p" 2>>"$RUN_DIR/errors.txt"
+    fi
+    if [ -e "$p" ] || [ -L "$p" ]; then
+        record FAIL "$cat" 0 "$p"
+        return 1
+    fi
+    record DEL "$cat" "$kb" "$p"
+    return 0
+}
+
+# Delete files older than DAYS below DIR (DIR itself stays), then empty sub-folders.
+clean_old_files_in() { # DIR DAYS CATEGORY
+    local dir="$1" days="$2" cat="$3" f
+    [ -d "$dir" ] && [ ! -L "$dir" ] || return 0
+    under_allowed_root "$dir/x" || return 0
+    while IFS= read -r -d '' f; do
+        safe_delete "$cat" "$f"
+    done < <(find "$dir" -xdev -type f -mtime +"$days" -print0 2>/dev/null)
+    if [ "$DRY_RUN" = 0 ]; then
+        find "$dir" -xdev -mindepth 1 -type d -empty -delete 2>/dev/null
+    fi
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# MacClean extras (balanced tier)
+# ----------------------------------------------------------------------------
+generic_tmp_file_excluded() {
+    case "$1" in
+        com.apple.* | *.sock | *.socket | *.pid | *.lock | .X* | *launchd* | TemporaryItems | .DS_Store) return 0 ;;
+    esac
+    return 1
+}
+
+extras_temp() {
+    if [ -z "$TMPD" ]; then
+        note "Temp cleanup skipped: could not determine your temp folder."
+        return 0
+    fi
+    if [ "$OS" = Darwin ]; then
+        case "$TMPD" in
+            /private/var/folders/*) ;;
+            *) note "Temp cleanup skipped: unexpected temp folder $TMPD"; return 0 ;;
+        esac
+    fi
+    say "  - temp folders (Playwright, Puppeteer, Claude, dev-tool leftovers)"
+    local root p name cat min
+    for root in "$TMPD" "$SYSTMP"; do
+        [ -n "$root" ] && [ -d "$root" ] || continue
+        for p in "$root"/* "$root"/.[!.]* "$root"/..?*; do
+            [ -e "$p" ] || [ -L "$p" ] || continue
+            [ -S "$p" ] && continue
+            [ -p "$p" ] && continue
+            name=${p##*/}
+            cat=""
+            min=0
+            case "$name" in
+                playwright-artifacts-*)
+                    cat="Playwright temp & profiles"; min=1440 ;;
+                playwright_chromiumdev_profile-* | playwright_firefoxdev_profile-* | playwright_webkitdev_profile-* | puppeteer_dev_chrome_profile-* | puppeteer_dev_firefox_profile-*)
+                    cat="Playwright temp & profiles"; min=120 ;;
+                playwright-transform-cache*)
+                    cat="Playwright temp & profiles"; min=$((7 * 1440)) ;;
+                playwright-mcp-output*)
+                    temp_children "$p" "Playwright MCP screenshots" $((PLAYWRIGHT_OUTPUT_MAX_AGE_DAYS * 1440))
+                    continue ;;
+                .org.chromium.Chromium.* | .com.google.Chrome.* | .com.microsoft.Edge.* | .com.brave.Browser.*)
+                    cat="Browser temp leftovers"; min=1440 ;;
+                claude-*)
+                    cat="Claude temp files"; min=$((2 * 1440)) ;;
+                node-compile-cache | jiti | tsx-* | ts-node-* | jest_* | haste-map-* | metro-* | react-native-packager-cache-* | \
+                    yarn--* | xfs-* | npm-* | pip-* | go-build* | TemporaryDirectory.* | tmp?????? | tmp???????? | tmp?????????)
+                    [ "$root" = "$TMPD" ] || continue
+                    cat="Dev-tool temp leftovers"; min=$((3 * 1440)) ;;
+                *)
+                    [ "$root" = "$TMPD" ] || continue
+                    [ -f "$p" ] && [ ! -L "$p" ] || continue
+                    generic_tmp_file_excluded "$name" && continue
+                    cat="Old temp files"; min=$((TMP_MAX_AGE_DAYS * 1440)) ;;
+            esac
+            [ "$min" -ge 60 ] || min=1440
+            recently_modified "$p" "$min" && continue
+            safe_delete "$cat" "$p"
+        done
+    done
+}
+
+temp_children() { # DIR CATEGORY MIN_AGE_MINUTES
+    local p
+    [ -d "$1" ] && [ ! -L "$1" ] || return 0
+    for p in "$1"/* "$1"/.[!.]*; do
+        [ -e "$p" ] || [ -L "$p" ] || continue
+        recently_modified "$p" "$3" && continue
+        safe_delete "$2" "$p"
+    done
+}
+
+# Old Playwright browser revisions: keep the newest revision of each browser and
+# every revision that a still-installed Playwright (registered in .links) needs.
+extras_playwright_browsers() {
+    [ "$PLAYWRIGHT_PRUNE_OLD_BROWSERS" = 1 ] || return 0
+    local root="$HOME/Library/Caches/ms-playwright" linkf target d name fam rev newest
+    [ -d "$root" ] && [ ! -L "$root" ] || return 0
+    say "  - old Playwright browser revisions"
+    : >"$RUN_DIR/pw_live"
+    for linkf in "$root/.links"/*; do
+        [ -f "$linkf" ] || continue
+        target=$(head -c 4096 "$linkf" 2>/dev/null | head -n 1)
+        [ -n "$target" ] && [ -f "$target/browsers.json" ] || continue
+        grep -oE '"[0-9]{3,7}"' "$target/browsers.json" 2>/dev/null | tr -d '"' >>"$RUN_DIR/pw_live"
+    done
+    : >"$RUN_DIR/pw_dirs"
+    for d in "$root"/*; do
+        [ -d "$d" ] && [ ! -L "$d" ] || continue
+        name=${d##*/}
+        case "$name" in
+            chromium-[0-9]* | chromium_headless_shell-[0-9]* | chromium_tip_of_tree-[0-9]* | chromium_tip_of_tree_headless_shell-[0-9]* | \
+                firefox-[0-9]* | firefox_beta-[0-9]* | webkit-[0-9]* | ffmpeg-[0-9]*) ;;
+            *) continue ;;
+        esac
+        fam=${name%-*}
+        rev=${name##*-}
+        is_int "$rev" || continue
+        printf '%s\t%s\t%s\n' "$fam" "$rev" "$d" >>"$RUN_DIR/pw_dirs"
+    done
+    # shellcheck disable=SC2094  # pw_dirs is only read here (twice), never written
+    while IFS="$TAB" read -r fam rev d; do
+        [ -n "$fam" ] || continue
+        newest=$(awk -F'\t' -v f="$fam" '$1 == f && $2 + 0 > m {m = $2 + 0} END {print m + 0}' "$RUN_DIR/pw_dirs")
+        [ "$rev" -eq "$newest" ] && continue
+        if grep -qx "$rev" "$RUN_DIR/pw_live"; then
+            logq "KEEP  (needed by an installed Playwright) $d"
+            continue
+        fi
+        recently_modified "$d" $((3 * 1440)) && continue
+        safe_delete "Old Playwright browsers" "$d"
+    done <"$RUN_DIR/pw_dirs"
+}
+
+# Playwright MCP keeps persistent Chrome profiles (with logins) in ms-playwright/mcp-*.
+# Only their regenerable browser caches go, and only while that browser is closed.
+extras_playwright_mcp_profiles() {
+    local root="$HOME/Library/Caches/ms-playwright" prof sub
+    [ -d "$root" ] && [ ! -L "$root" ] || return 0
+    for prof in "$root"/mcp-*; do
+        [ -d "$prof" ] && [ ! -L "$prof" ] || continue
+        if path_in_ps "$prof" || path_in_use "$prof"; then
+            logq "SKIP  (Playwright MCP browser is running) $prof"
+            continue
+        fi
+        for sub in "Default/Cache" "Default/Code Cache" "Default/GPUCache" "Default/DawnGraphiteCache" \
+            "Default/DawnWebGPUCache" "GrShaderCache" "GraphiteDawnCache" "ShaderCache" "GPUPersistentCache" \
+            "component_crx_cache" "extensions_crx_cache"; do
+            [ -d "$prof/$sub" ] && [ ! -L "$prof/$sub" ] || continue
+            recently_modified "$prof/$sub" 60 && continue
+            safe_delete "Playwright MCP browser caches" "$prof/$sub"
+        done
+    done
+}
+
+# Playwright MCP screenshots and Playwright test output inside project folders.
+extras_project_outputs() {
+    local r dir
+    say "  - Playwright MCP screenshots & old test reports in project folders"
+    if [ -d "$HOME/.playwright-mcp" ] && [ ! -L "$HOME/.playwright-mcp" ]; then
+        clean_old_files_in "$HOME/.playwright-mcp" "$PLAYWRIGHT_OUTPUT_MAX_AGE_DAYS" "Playwright MCP screenshots"
+    fi
+    while IFS= read -r r; do
+        [ -n "$r" ] || continue
+        while IFS= read -r -d '' dir; do
+            case "${dir##*/}" in
+                .playwright-mcp)
+                    clean_old_files_in "$dir" "$PLAYWRIGHT_OUTPUT_MAX_AGE_DAYS" "Playwright MCP screenshots" ;;
+                test-results)
+                    [ -f "$dir/.last-run.json" ] || continue
+                    recently_modified "$dir" $((7 * 1440)) && continue
+                    safe_delete "Playwright test results & reports" "$dir" ;;
+                playwright-report)
+                    [ -f "$dir/index.html" ] || continue
+                    head -c 400000 "$dir/index.html" 2>/dev/null | grep -qi 'playwright' || continue
+                    recently_modified "$dir" $((7 * 1440)) && continue
+                    safe_delete "Playwright test results & reports" "$dir" ;;
+            esac
+        done < <(run_timeout 300 find "$r" -xdev -maxdepth 8 \
+            \( -name node_modules -o -name .git -o -name Library -o -name Pods -o -name .venv -o -name venv \
+            -o -name vendor -o -name DerivedData -o -name .next -o -name target -o -name .gradle -o -name build \
+            -o -name dist \) -prune -o \
+            -type d \( -name .playwright-mcp -o -name test-results -o -name playwright-report \) -print0 -prune 2>/dev/null)
+    done <<EOF
+$PROJECT_DIRS
+EOF
+}
+
+# Claude Code: only the known-ephemeral folders. Transcripts, history, settings,
+# skills, plugins and memory are protected and never touched.
+extras_claude_code() {
+    local d
+    [ -n "$CLAUDE_DIRS" ] || return 0
+    say "  - Claude Code debug logs, shell snapshots, old todo files"
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        clean_old_files_in "$d/debug" "$CLAUDE_DEBUG_MAX_AGE_DAYS" "Claude Code debug logs & snapshots"
+        clean_old_files_in "$d/shell-snapshots" "$CLAUDE_DEBUG_MAX_AGE_DAYS" "Claude Code debug logs & snapshots"
+        clean_old_files_in "$d/todos" 30 "Claude Code debug logs & snapshots"
+    done <<EOF
+$CLAUDE_DIRS
+EOF
+}
+
+# Claude desktop Electron caches - only while the app is closed.
+extras_claude_desktop() {
+    [ "$CLAUDE_DESKTOP_CACHES" = 1 ] || return 0
+    local base="$HOME/Library/Application Support/Claude" sub d c
+    [ -d "$base" ] && [ ! -L "$base" ] || return 0
+    if pgrep -x Claude >/dev/null 2>&1 || path_in_use "$base"; then
+        note "Claude desktop was open, so its browser caches were left for a run while it is closed."
+        return 0
+    fi
+    say "  - Claude desktop browser caches (app is closed)"
+    for sub in "Cache" "Code Cache" "GPUCache" "DawnGraphiteCache" "DawnWebGPUCache"; do
+        d="$base/$sub"
+        [ -d "$d" ] && [ ! -L "$d" ] || continue
+        for c in "$d"/* "$d"/.[!.]*; do
+            [ -e "$c" ] || [ -L "$c" ] || continue
+            safe_delete "Claude desktop caches" "$c"
+        done
+    done
+}
+
+# npx package cache: drop packages not used for a while and not running now
+# (running MCP servers show up on the process list and are kept).
+extras_npx() {
+    local root="$HOME/.npm/_npx" d
+    [ -d "$root" ] && [ ! -L "$root" ] || return 0
+    say "  - stale npx packages"
+    for d in "$root"/*; do
+        [ -d "$d" ] && [ ! -L "$d" ] || continue
+        recently_modified "$d" $((NPX_MAX_AGE_DAYS * 1440)) && continue
+        safe_delete "Stale npx packages" "$d"
+    done
+}
+
+extras_misc_caches() {
+    local p
+    if [ -d "$HOME/.nvm/.cache" ] && [ ! -L "$HOME/.nvm/.cache" ]; then
+        for p in "$HOME/.nvm/.cache"/* "$HOME/.nvm/.cache"/.[!.]*; do
+            [ -e "$p" ] || [ -L "$p" ] || continue
+            recently_modified "$p" 60 && continue
+            safe_delete "Download caches (nvm)" "$p"
+        done
+    fi
+    if [ -d "$HOME/.npm/_libvips" ] && [ ! -L "$HOME/.npm/_libvips" ]; then
+        for p in "$HOME/.npm/_libvips"/*; do
+            [ -e "$p" ] || [ -L "$p" ] || continue
+            recently_modified "$p" 1440 && continue
+            safe_delete "Download caches (npm sharp/libvips)" "$p"
+        done
+    fi
+    if [ -d "$HOME/.thumbnails" ] && [ ! -L "$HOME/.thumbnails" ]; then
+        for p in "$HOME/.thumbnails"/*; do
+            [ -e "$p" ] || [ -L "$p" ] || continue
+            safe_delete "Thumbnail cache (~/.thumbnails)" "$p"
+        done
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# MacClean extras (deep tier)
+# ----------------------------------------------------------------------------
+extras_trash() {
+    [ "$DEEP_TRASH" = 1 ] || return 0
+    local t="$HOME/.Trash" p
+    [ -d "$t" ] && [ ! -L "$t" ] || return 0
+    if ! ls "$t" >/dev/null 2>&1; then
+        note "Trash is not readable without Full Disk Access - skipped."
+        return 0
+    fi
+    say "  - Trash items that have been in the Trash ${TRASH_MIN_AGE_DAYS}+ days"
+    while IFS= read -r -d '' p; do
+        safe_delete "Trash (in Trash ${TRASH_MIN_AGE_DAYS}+ days)" "$p"
+    done < <(find "$t" -mindepth 1 -maxdepth 1 -ctime +"$TRASH_MIN_AGE_DAYS" -print0 2>/dev/null)
+}
+
+extras_puppeteer() {
+    [ "$DEEP_PUPPETEER" = 1 ] || return 0
+    local root="$HOME/.cache/puppeteer" b v first
+    [ -d "$root" ] && [ ! -L "$root" ] || return 0
+    say "  - old Puppeteer browser versions (newest per browser kept)"
+    for b in "$root"/*; do
+        [ -d "$b" ] && [ ! -L "$b" ] || continue
+        first=1
+        while IFS= read -r v; do
+            [ -n "$v" ] || continue
+            if [ "$first" = 1 ]; then first=0; continue; fi
+            safe_delete "Old Puppeteer browsers" "$b/$v"
+        done < <(ls -1t "$b" 2>/dev/null)
+    done
+}
+
+# ----------------------------------------------------------------------------
+# Mole
+# ----------------------------------------------------------------------------
+find_mole() {
+    local c
+    for c in "$(command -v mo 2>/dev/null)" /opt/homebrew/bin/mo /usr/local/bin/mo "$HOME/.local/bin/mo"; do
+        [ -n "$c" ] && [ -x "$c" ] || continue
+        if "$c" --version </dev/null 2>/dev/null | grep -qi mole; then
+            MOLE_BIN=$c
+            return 0
+        fi
+    done
+    return 1
+}
+
+mole_allowed_here() {
+    [ "$USE_MOLE" = 1 ] || { note "Mole step disabled in config (USE_MOLE=0)."; return 1; }
+    find_mole || { note "Mole (mo) not found - install it with: brew install mole"; return 1; }
+    if [ "$IN_AGENT" = 1 ] && [ "$HAS_FDA" != 1 ]; then
+        note "Mole was skipped in the background agent because 'MacClean Agent' has no Full Disk Access yet (System Settings > Privacy & Security > Full Disk Access)."
+        return 1
+    fi
+    return 0
+}
+
+# Paths MacClean always keeps away from Mole: your data, logins, or caches that MacClean
+# itself cleans only while the owning app is closed.
+MOLE_EXTRA_PROTECT="~/Library/Developer/Xcode/Archives
+~/.aws
+~/Library/Application Support/Claude/Cache
+~/Library/Application Support/Claude/Code Cache
+~/Library/Application Support/Claude/GPUCache
+~/Library/Application Support/Claude/DawnGraphiteCache
+~/Library/Application Support/Claude/DawnWebGPUCache"
+
+ensure_mole_whitelist() {
+    local home_re line missing=""
+    if [ ! -f "$MOLE_WL" ]; then
+        mkdir -p "${MOLE_WL%/*}" || return 0
+        # A new file replaces Mole's optional defaults, so write those defaults too (Mole 1.73).
+        cat >"$MOLE_WL" <<'EOF'
+# Mole Whitelist - Protected paths won't be deleted
+# Saved selections replace optional defaults; built-in safety protections still apply.
+# Add one pattern per line to keep items safe.
+# Written by MacClean: Mole's default protections (MacClean adds its own below).
+~/Library/Caches/ms-playwright*
+~/Library/Caches/camoufox*
+~/Library/Caches/Cypress*
+~/.gradle/caches/*
+~/.gradle/daemon/*
+~/.ollama/models/*
+~/Library/Caches/com.nssurge.surge-mac/*
+~/Library/Application Support/com.nssurge.surge-mac/*
+~/Library/Caches/org.R-project.R/R/renv/*
+~/Library/Caches/JetBrains*
+~/Library/Caches/com.jetbrains.toolbox*
+~/Library/Caches/tealdeer/tldr-pages
+~/Library/Application Support/JetBrains*
+~/Library/Caches/com.apple.finder
+~/Library/Mobile Documents*
+FINDER_METADATA
+EOF
+        logq "Mole whitelist: created with Mole's default protections"
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        grep -Fxq -- "$line" "$MOLE_WL" 2>/dev/null || missing="$missing$line$NL"
+    done <<EOF
+$MOLE_EXTRA_PROTECT
+EOF
+    if [ "$PROTECT_TRASH" = 1 ]; then
+        home_re=$(printf '%s' "$HOME" | sed 's/[][\.*^$+?(){}|]/\\&/g')
+        grep -Eq "^[[:space:]]*(~|\\\$HOME|$home_re)/\\.Trash/?[[:space:]]*\$" "$MOLE_WL" 2>/dev/null || missing="$missing~/.Trash$NL"
+    fi
+    [ -n "$missing" ] || return 0
+    cp -p "$MOLE_WL" "$MOLE_WL.bak-$(date +%Y%m%d%H%M%S)" 2>/dev/null
+    {
+        printf '\n# Added by MacClean: keep away from Mole (your data/logins, the Trash, or caches MacClean cleans only while the app is closed)\n'
+        printf '%s' "$missing"
+    } >>"$MOLE_WL"
+    logq "Mole whitelist: added $(printf '%s' "$missing" | tr '\n' ';')"
+}
+
+mole_version() {
+    "$MOLE_BIN" --version </dev/null 2>/dev/null | tr -d '\r' | sed "s/${ESC}\\[[0-9;?]*[A-Za-z]//g" |
+        grep -i -m1 -E 'mole|[0-9]+\.[0-9]+\.[0-9]+' | sed 's/^[[:space:]]*//'
+}
+
+run_mole_clean() {
+    mole_allowed_here || return 0
+    ensure_mole_whitelist
+    local out="$RUN_DIR/mole-clean.txt" rc
+    if [ "$DRY_RUN" = 1 ]; then
+        say "-> Mole: mo clean --dry-run"
+        run_timeout 3600 env TERM=dumb NO_COLOR=1 "$MOLE_BIN" clean --dry-run >"$out" 2>&1 </dev/null
+    else
+        say "-> Mole: mo clean"
+        run_timeout 3600 env TERM=dumb NO_COLOR=1 "$MOLE_BIN" clean >"$out" 2>&1 </dev/null
+    fi
+    rc=$?
+    logq "----- Mole output -----"
+    clean_output "$out" >>"$LOG_FILE"
+    logq "----- end Mole output -----"
+    MOLE_SUMMARY=$(clean_output "$out" | grep -E 'Potential space:|Space freed:|Removed:|Free space now:|already clean|No significant|No additional|incomplete|interrupted|cancelled' | sed 's/^[[:space:]]*//' | head -n 6)
+    [ "$rc" -eq 0 ] || note "Mole exited with code $rc (details in the log)."
+    [ -n "$MOLE_SUMMARY" ] || MOLE_SUMMARY="(no summary line found - see log)"
+}
+
+run_mole_purge() {
+    [ "$DEEP_MOLE_PURGE" = 1 ] || return 0
+    mole_allowed_here || return 0
+    local out="$RUN_DIR/mole-purge.txt" rc
+    if [ "$DRY_RUN" = 1 ]; then
+        say "-> Mole: mo purge --dry-run (project build/dependency folders idle 7+ days)"
+        run_timeout 3600 env TERM=dumb NO_COLOR=1 "$MOLE_BIN" purge --dry-run >"$out" 2>&1 </dev/null
+    else
+        say "-> Mole: mo purge --yes (project build/dependency folders idle 7+ days)"
+        run_timeout 3600 env TERM=dumb NO_COLOR=1 "$MOLE_BIN" purge --yes >"$out" 2>&1 </dev/null
+    fi
+    rc=$?
+    logq "----- Mole purge output -----"
+    clean_output "$out" >>"$LOG_FILE"
+    logq "----- end Mole purge output -----"
+    MOLE_PURGE_SUMMARY=$(clean_output "$out" | grep -v '^[[:space:]]*$' | tail -n 4 | sed 's/^[[:space:]]*//')
+    [ "$rc" -eq 0 ] || note "mo purge exited with code $rc (details in the log)."
+}
+
+report_mole_analyze() {
+    find_mole || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    if [ "$IN_AGENT" = 1 ] && [ "$HAS_FDA" != 1 ]; then return 0; fi
+    local out="$RUN_DIR/analyze.json"
+    say "-> Mole: mo analyze --json ~ (sizes only)"
+    run_timeout 300 "$MOLE_BIN" analyze --json "$HOME" >"$out" 2>/dev/null </dev/null || return 0
+    jq -r '.entries // [] | sort_by(-(.size // 0)) | .[:15][] | "\(.size // 0)\t\(.name)\t\(if .cleanable then "cache" else "" end)"' "$out" 2>/dev/null |
+        while IFS="$TAB" read -r bytes name tag; do
+            is_int "$bytes" || continue
+            printf '%s\t%s\t%s\n' "$((bytes / 1024))" "~/$name" "$tag"
+        done >"$RUN_DIR/analyze.tsv"
+}
+
+# ----------------------------------------------------------------------------
+# Docker (deep tier)
+# ----------------------------------------------------------------------------
+run_docker_deep() {
+    [ "$DEEP_DOCKER" = 1 ] || return 0
+    command -v docker >/dev/null 2>&1 || return 0
+    if ! run_timeout 20 docker info >/dev/null 2>&1 </dev/null; then
+        note "Docker is not running - Docker cleanup skipped."
+        return 0
+    fi
+    local hours=$((DOCKER_IMAGE_MIN_AGE_DAYS * 24)) out="$RUN_DIR/docker.txt"
+    if [ "$DRY_RUN" = 1 ]; then
+        say "-> Docker: docker system df (preview)"
+        run_timeout 120 docker system df >"$out" 2>&1 </dev/null
+        DOCKER_SUMMARY="deep clean would prune unused images older than ${DOCKER_IMAGE_MIN_AGE_DAYS} days and unused build cache older than 7 days. Current usage:$NL$(sed 's/^/    /' "$out")"
+    else
+        say "-> Docker: prune unused images older than ${DOCKER_IMAGE_MIN_AGE_DAYS} days + old build cache"
+        run_timeout 1800 docker image prune -a -f --filter "until=${hours}h" >"$out" 2>&1 </dev/null
+        run_timeout 1800 docker builder prune -a -f --filter "until=168h" >>"$out" 2>&1 </dev/null
+        DOCKER_SUMMARY=$(grep -E 'Total( reclaimed space)?:' "$out" | sed 's/^[[:space:]]*//' | tr '\n' ' ')
+        [ -n "$DOCKER_SUMMARY" ] || DOCKER_SUMMARY="nothing to prune"
+    fi
+    cat "$out" >>"$LOG_FILE"
+}
+
+# ----------------------------------------------------------------------------
+# System level (root helper with fixed actions, passwordless via sudoers)
+# ----------------------------------------------------------------------------
+run_root_helper() { # check|scan|clean|deep-scan|deep
+    [ "$SYSTEM_CLEAN" = 1 ] || { note "System-level step disabled in config (SYSTEM_CLEAN=0)."; return 0; }
+    if [ ! -x "$ROOT_HELPER" ]; then
+        note "System-level helper is not installed - run: bash ~/MacClean/install.sh"
+        return 0
+    fi
+    local out="$RUN_DIR/root.txt"
+    say "-> System level: macclean-root $1"
+    run_timeout 1200 sudo -n "$ROOT_HELPER" "$1" >"$out" 2>&1 </dev/null
+    ROOT_RAN=1
+    cat "$out" >>"$LOG_FILE"
+    if grep -qiE 'password is required|terminal is required|not allowed to execute|may not run sudo|askpass' "$out"; then
+        note "Passwordless rule for the system helper is missing - re-run: bash ~/MacClean/install.sh"
+        ROOT_RAN=0
+        return 0
+    fi
+    ROOT_KB=$(awk -F'\t' '$1 == "ROOT_TOTAL" {k = $2} END {print k + 0}' "$out")
+    ROOT_N=$(awk -F'\t' '$1 == "ROOT_TOTAL" {n = $3} END {print n + 0}' "$out")
+    ROOT_LINES=$(awk -F'\t' '$1 == "ROOT_ITEM" && ($3 > 0 || $4 > 0) {print $2 "\t" $3 "\t" $4}' "$out")
+    grep '^NOTE' "$out" | sed 's/^NOTE[[:space:]]*//' >>"$NOTES"
+}
+
+# ----------------------------------------------------------------------------
+# Reporting
+# ----------------------------------------------------------------------------
+detect_fda() {
+    HAS_FDA=unknown
+    [ "$OS" = Darwin ] || return 0
+    local t tested=0 ok=0
+    for t in "$HOME/Library/Application Support/com.apple.TCC" "$HOME/Library/Safari" "$HOME/Library/Mail" "$HOME/Library/Messages"; do
+        [ -e "$t" ] || continue
+        tested=$((tested + 1))
+        if ls "$t" >/dev/null 2>&1; then ok=$((ok + 1)); fi
+    done
+    if [ "$tested" -eq 0 ]; then HAS_FDA=unknown; elif [ "$ok" -gt 0 ]; then HAS_FDA=1; else HAS_FDA=0; fi
+}
+
+big() { # LABEL PATH
+    local kb
+    [ -e "$2" ] || return 0
+    kb=$(run_timeout 120 du -skx "$2" 2>/dev/null </dev/null | awk 'NR == 1 {print $1 + 0}')
+    is_int "${kb:-}" || return 0
+    [ "$kb" -ge $((BIG_ITEM_MIN_MB * 1024)) ] || return 0
+    printf '%s\t%s\t%s\n' "$kb" "$1" "$(tildify "$2")" >>"$BIG"
+}
+
+report_big_items() {
+    say "-> Measuring large folders that need a human decision (sizes only)"
+    local d n
+    big "Claude Cowork VM bundles" "$HOME/Library/Application Support/Claude/vm_bundles"
+    big "Claude desktop: bundled Claude Code versions" "$HOME/Library/Application Support/Claude/claude-code"
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        big "Claude Code transcripts ($(tildify "$d")) - set cleanupPeriodDays to age them out" "$d/projects"
+    done <<EOF
+$CLAUDE_DIRS
+EOF
+    big "Claude Code MCP logs" "$HOME/Library/Caches/claude-cli-nodejs"
+    big "npx package cache (in-use part)" "$HOME/.npm/_npx"
+    big "Playwright browsers still in use" "$HOME/Library/Caches/ms-playwright"
+    big "Puppeteer browsers" "$HOME/.cache/puppeteer"
+    big "Unreal Engine shared DerivedDataCache" "$HOME/Library/Application Support/Epic/UnrealEngine/Common/DerivedDataCache"
+    big "Unity caches & Asset Store downloads" "$HOME/Library/Unity"
+    big "Android emulators (AVDs)" "$HOME/.android/avd"
+    big "Android SDK" "$HOME/Library/Android/sdk"
+    big "Gradle caches" "$HOME/.gradle"
+    big "Node versions (nvm)" "$HOME/.nvm/versions"
+    big "Ruby versions (rbenv)" "$HOME/.rbenv/versions"
+    big ".NET SDKs" "$HOME/.dotnet"
+    big "NuGet packages" "$HOME/.nuget/packages"
+    big "Maven repository" "$HOME/.m2/repository"
+    big "Yarn Berry global cache" "$HOME/.yarn/berry/cache"
+    big "Xcode archives" "$HOME/Library/Developer/Xcode/Archives"
+    big "iOS simulators" "$HOME/Library/Developer/CoreSimulator/Devices"
+    big "Ollama models" "$HOME/.ollama/models"
+    big "Hugging Face cache" "$HOME/.cache/huggingface"
+    big "LM Studio models" "$HOME/.lmstudio/models"
+    big "DDEV Mutagen sync data" "$HOME/.ddev_mutagen_data_directory"
+    if ls "$HOME/.Trash" >/dev/null 2>&1; then big "Trash" "$HOME/.Trash"; fi
+    for d in /Applications/Install\ macOS*.app; do
+        [ -d "$d" ] && big "macOS installer app" "$d"
+    done
+    if command -v tmutil >/dev/null 2>&1; then
+        n=$(tmutil listlocalsnapshots / 2>/dev/null | grep -c 'com.apple')
+        if is_int "$n" && [ "$n" -gt 0 ]; then
+            note "$n Time Machine local snapshot(s) exist; space freed now may only show up after they expire (normally within 24h). A deep clean can remove ones older than 24h."
+        fi
+    fi
+    if command -v docker >/dev/null 2>&1 && run_timeout 20 docker info >/dev/null 2>&1 </dev/null; then
+        run_timeout 120 docker system df --format '{{.Type}}: {{.Size}} (reclaimable {{.Reclaimable}})' >"$RUN_DIR/docker-df.txt" 2>/dev/null </dev/null
+        if [ -s "$RUN_DIR/docker-df.txt" ]; then
+            note "Docker usage: $(tr '\n' ';' <"$RUN_DIR/docker-df.txt" | sed 's/;$//; s/;/; /g')"
+        fi
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Run lifecycle
+# ----------------------------------------------------------------------------
+acquire_lock() { # MAX_WAIT_SECONDS
+    local waited=0 pid
+    mkdir -p "$STATE_DIR"
+    while ! mkdir "$STATE_DIR/lock" 2>/dev/null; do
+        pid=$(cat "$STATE_DIR/lock/pid" 2>/dev/null)
+        if is_int "$pid" && ! ps -p "$pid" -o pid= >/dev/null 2>&1; then
+            rm -rf -- "$STATE_DIR/lock"
+            continue
+        fi
+        if [ -z "$pid" ] && [ -n "$(find "$STATE_DIR/lock" -maxdepth 0 -mmin +240 2>/dev/null)" ]; then
+            rm -rf -- "$STATE_DIR/lock"
+            continue
+        fi
+        [ "$waited" -ge "$1" ] && return 1
+        sleep 5
+        waited=$((waited + 5))
+    done
+    echo $$ >"$STATE_DIR/lock/pid"
+    LOCK_HELD=1
+    return 0
+}
+
+release_lock() {
+    if [ "$LOCK_HELD" = 1 ]; then rm -rf -- "$STATE_DIR/lock"; fi
+    LOCK_HELD=0
+}
+
+on_exit() {
+    if [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ]; then rm -rf -- "$RUN_DIR"; fi
+    release_lock
+}
+trap on_exit EXIT
+trap 'exit 130' INT TERM HUP
+
+start_run() { # MODE ID
+    RUN_MODE=$1
+    RUN_ID=$2
+    mkdir -p "$REPORTS_DIR" "$STATE_DIR" || exit 1
+    LOG_FILE="$REPORTS_DIR/$RUN_ID.log"
+    SUMMARY_FILE="$REPORTS_DIR/$RUN_ID.summary.txt"
+    RUN_DIR="$STATE_DIR/run.$RUN_ID"
+    rm -rf -- "$RUN_DIR"
+    mkdir -p "$RUN_DIR" || exit 1
+    ACTIONS="$RUN_DIR/actions.tsv"
+    NOTES="$RUN_DIR/notes.txt"
+    BIG="$RUN_DIR/big.tsv"
+    : >"$ACTIONS"
+    : >"$NOTES"
+    : >"$BIG"
+    : >"$LOG_FILE"
+    FREE_BEFORE=$(free_kb)
+    discover_claude_dirs
+    discover_project_roots
+    build_safety_lists
+    logq "MacClean $MACCLEAN_VERSION - mode=$RUN_MODE id=$RUN_ID started $(date '+%Y-%m-%d %H:%M:%S') agent=$IN_AGENT fda=$HAS_FDA"
+    logq "temp=$TMPD systmp=$SYSTMP"
+}
+
+finish_run() {
+    local status=ok free_after="" ex_kb ex_n skips fails verb delta
+    if [ "$DRY_RUN" = 0 ]; then free_after=$(free_kb); fi
+    ex_kb=$(awk -F'\t' '$1 == "DEL" || $1 == "WOULD" {s += $3} END {print s + 0}' "$ACTIONS")
+    ex_n=$(awk -F'\t' '$1 == "DEL" || $1 == "WOULD" {n++} END {print n + 0}' "$ACTIONS")
+    skips=$(awk -F'\t' '$1 == "SKIP" {n++} END {print n + 0}' "$ACTIONS")
+    fails=$(awk -F'\t' '$1 == "FAIL" {n++} END {print n + 0}' "$ACTIONS")
+    [ "$fails" -gt 0 ] && status=partial
+    verb="Freed"
+    [ "$DRY_RUN" = 1 ] && verb="Would free"
+    {
+        printf 'MacClean %s - %s\n' "$RUN_MODE" "$(date '+%Y-%m-%d %H:%M')"
+        if [ "$DRY_RUN" = 1 ]; then printf 'Preview only - nothing was deleted.\n'; fi
+        if [ -n "$free_after" ] && is_int "$FREE_BEFORE" && is_int "$free_after"; then
+            delta=$((free_after - FREE_BEFORE))
+            if [ "$delta" -ge 0 ]; then
+                printf 'Free space: %s -> %s (+%s)\n' "$(human_kb "$FREE_BEFORE")" "$(human_kb "$free_after")" "$(human_kb "$delta")"
+            else
+                printf 'Free space: %s -> %s (other apps wrote data meanwhile)\n' "$(human_kb "$FREE_BEFORE")" "$(human_kb "$free_after")"
+            fi
+        elif is_int "${FREE_BEFORE:-}"; then
+            printf 'Free space now: %s\n' "$(human_kb "$FREE_BEFORE")"
+        fi
+        if [ "$RUN_MODE" != report ]; then
+            printf '\nMacClean extras - %s: %s in %s items\n' "$verb" "$(human_kb "$ex_kb")" "$ex_n"
+            awk -F'\t' '$1 == "DEL" || $1 == "WOULD" {s[$2] += $3; n[$2]++} END {for (c in s) printf "%d\t%s\t%d\n", s[c], c, n[c]}' "$ACTIONS" |
+                sort -t "$TAB" -k1,1nr | while IFS="$TAB" read -r kb c n; do
+                printf '  - %s: %s (%s)\n' "$c" "$(human_kb "$kb")" "$n"
+            done
+            [ "$skips" -gt 0 ] && printf '  Skipped %s items that were in use, protected or not yours (see log).\n' "$skips"
+            [ "$fails" -gt 0 ] && printf '  Could not delete %s items (see log).\n' "$fails"
+            if [ -n "$MOLE_SUMMARY" ]; then
+                printf '\nMole (mo clean):\n'
+                printf '%s\n' "$MOLE_SUMMARY" | sed 's/^/  /'
+            fi
+            if [ -n "$MOLE_PURGE_SUMMARY" ]; then
+                printf '\nMole (mo purge):\n'
+                printf '%s\n' "$MOLE_PURGE_SUMMARY" | sed 's/^/  /'
+            fi
+            if [ -n "$DOCKER_SUMMARY" ]; then printf '\nDocker: %s\n' "$DOCKER_SUMMARY"; fi
+            if [ "$ROOT_RAN" = 1 ]; then
+                printf '\nSystem level (root helper) - %s: %s in %s files\n' "$verb" "$(human_kb "$ROOT_KB")" "$ROOT_N"
+                if [ -n "$ROOT_LINES" ]; then
+                    printf '%s\n' "$ROOT_LINES" | while IFS="$TAB" read -r c kb n; do
+                        [ -n "$c" ] || continue
+                        if [ "$kb" -gt 0 ]; then printf '  - %s: %s (%s)\n' "$c" "$(human_kb "$kb")" "$n"; else printf '  - %s: %s\n' "$c" "$n"; fi
+                    done
+                fi
+            fi
+        fi
+        if [ -s "$RUN_DIR/analyze.tsv" ]; then
+            printf '\nBiggest folders in your home (Mole analyze):\n'
+            while IFS="$TAB" read -r kb name tag; do
+                printf '  - %s: %s%s\n' "$name" "$(human_kb "$kb")" "${tag:+ ($tag)}"
+            done <"$RUN_DIR/analyze.tsv"
+        fi
+        if [ -s "$BIG" ]; then
+            printf '\nLarge items left alone (your call):\n'
+            sort -t "$TAB" -k1,1nr "$BIG" | while IFS="$TAB" read -r kb label path; do
+                printf '  - %s: %s  (%s)\n' "$label" "$(human_kb "$kb")" "$path"
+            done
+        fi
+        if [ -s "$NOTES" ]; then
+            printf '\nNotes:\n'
+            sort -u "$NOTES" | sed 's/^/  - /'
+        fi
+        printf '\nFull log: %s\n' "$(tildify "$LOG_FILE")"
+        printf 'RESULT\tmode=%s\tstatus=%s\textras_kb=%s\troot_kb=%s\tfree_before_kb=%s\tfree_after_kb=%s\n' \
+            "$RUN_MODE" "$status" "$ex_kb" "$ROOT_KB" "${FREE_BEFORE:-}" "${free_after:-}"
+    } >"$SUMMARY_FILE"
+    {
+        printf '\n===== SUMMARY =====\n'
+        cat "$SUMMARY_FILE"
+        if [ -s "$RUN_DIR/errors.txt" ]; then
+            printf '\n===== ERRORS =====\n'
+            cat "$RUN_DIR/errors.txt"
+        fi
+    } >>"$LOG_FILE"
+    if [ ! -f "$REPORTS_DIR/history.tsv" ]; then
+        printf 'date\tmode\trun_id\tstatus\textras_kb\troot_kb\tfree_before_kb\tfree_after_kb\tmole\n' >"$REPORTS_DIR/history.tsv"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$RUN_MODE" "$RUN_ID" "$status" \
+        "$ex_kb" "$ROOT_KB" "${FREE_BEFORE:-}" "${free_after:-}" "$(printf '%s' "$MOLE_SUMMARY" | tr '\n\t' '  ')" >>"$REPORTS_DIR/history.tsv"
+    LAST_FREED_KB=$((ex_kb + ROOT_KB))
+    rm -rf -- "$RUN_DIR"
+    RUN_DIR=""
+    prune_reports
+}
+
+prune_reports() {
+    local n=0 f base
+    # shellcheck disable=SC2012  # our own report names (safe characters), sorted by age
+    ls -1t "$REPORTS_DIR"/*.log 2>/dev/null | while IFS= read -r f; do
+        case "${f##*/}" in agent.*) continue ;; esac
+        n=$((n + 1))
+        [ "$n" -le "$KEEP_REPORTS" ] && continue
+        base=${f%.log}
+        rm -f -- "$f" "$base.summary.txt" "$base.done" "$base.request"
+    done
+}
+
+do_balanced() {
+    snapshot_processes
+    say "-> MacClean extras"
+    extras_temp
+    extras_playwright_browsers
+    extras_playwright_mcp_profiles
+    extras_project_outputs
+    extras_claude_code
+    extras_claude_desktop
+    extras_npx
+    extras_misc_caches
+}
+
+do_deep_extras() {
+    extras_trash
+    extras_puppeteer
+}
+
+root_mode_for() { # scan|clean -> helper mode honoring DEEP_TM_SNAPSHOTS
+    if [ "$DEEP_TM_SNAPSHOTS" = 1 ]; then
+        [ "$1" = scan ] && echo deep-scan || echo deep
+    else
+        echo "$1"
+    fi
+}
+
+run_mode() { # MODE ID
+    start_run "$1" "$2"
+    case "$1" in
+        scan)
+            DRY_RUN=1
+            do_balanced
+            run_mole_clean
+            run_root_helper scan
+            report_big_items ;;
+        clean)
+            DRY_RUN=0
+            do_balanced
+            run_mole_clean
+            run_root_helper clean ;;
+        deep-scan)
+            DRY_RUN=1
+            do_balanced
+            do_deep_extras
+            run_mole_clean
+            run_mole_purge
+            run_docker_deep
+            run_root_helper "$(root_mode_for scan)"
+            report_big_items ;;
+        deep)
+            DRY_RUN=0
+            do_balanced
+            do_deep_extras
+            run_mole_clean
+            run_mole_purge
+            run_docker_deep
+            run_root_helper "$(root_mode_for clean)" ;;
+        report)
+            DRY_RUN=1
+            report_big_items
+            report_mole_analyze ;;
+    esac
+    finish_run
+}
+
+# ----------------------------------------------------------------------------
+# Status
+# ----------------------------------------------------------------------------
+mode_status() {
+    local out last now next
+    printf 'MacClean %s status\n' "$MACCLEAN_VERSION"
+    printf '  Folder: %s   Config: %s\n' "$(tildify "$MC_HOME")" "$( [ -f "$CONFIG_FILE" ] && echo present || echo 'missing (defaults)')"
+    if [ -x /opt/macclean/bin/macclean ]; then printf '  Installed: /opt/macclean/bin (root-owned)\n'; else printf '  Installed: NO - run: bash ~/MacClean/install.sh\n'; fi
+    out=$(run_timeout 20 sudo -n "$ROOT_HELPER" check 2>&1 </dev/null)
+    case "$out" in ok*) printf '  Passwordless system helper: OK\n' ;; *) printf '  Passwordless system helper: MISSING (%s)\n' "$(printf '%s' "$out" | head -n 1)" ;; esac
+    if find_mole; then printf '  Mole: %s (%s)\n' "$MOLE_BIN" "$(mole_version)"; else printf '  Mole: not found (brew install mole)\n'; fi
+    if [ "$OS" = Darwin ] && launchctl print "gui/$UID_NUM/$AGENT_LABEL" >/dev/null 2>&1; then
+        printf '  Background agent: loaded (%s)\n' "$AGENT_LABEL"
+    else
+        printf '  Background agent: NOT loaded\n'
+    fi
+    [ -d "$AGENT_APP" ] || printf '  Agent app missing: %s\n' "$(tildify "$AGENT_APP")"
+    case "$HAS_FDA" in
+        1) printf '  Full Disk Access (this process): yes\n' ;;
+        0) printf '  Full Disk Access (this process): no\n' ;;
+        *) printf '  Full Disk Access (this process): unknown\n' ;;
+    esac
+    [ "$IN_AGENT" = 1 ] && printf '  (checked inside the background agent)\n'
+    if [ "$PROTECT_TRASH" = 1 ]; then
+        if [ -f "$MOLE_WL" ] && grep -q '\.Trash' "$MOLE_WL" 2>/dev/null; then printf '  Mole whitelist: Trash protected\n'; else printf '  Mole whitelist: Trash NOT protected yet (fixed on next run)\n'; fi
+    fi
+    last=$(cat "$STATE_DIR/last_scheduled" 2>/dev/null)
+    now=$(date +%s)
+    printf '  Schedule: %s (when idle %s+ min)' "$SCHEDULE" "$IDLE_MINUTES"
+    if is_int "${last:-}" && [ "$SCHEDULE" != off ]; then
+        if [ "$SCHEDULE" = daily ]; then next=$((last + 86400 - 3600)); else next=$((last + 7 * 86400 - 3600)); fi
+        printf ' - last %s, next due after %s' "$(fmt_epoch "$last")" "$(fmt_epoch "$next")"
+    fi
+    printf '\n'
+    if [ -f "$REPORTS_DIR/history.tsv" ]; then
+        printf '  Recent runs:\n'
+        tail -n 5 "$REPORTS_DIR/history.tsv" | awk -F'\t' 'NR > 0 && $1 != "date" {printf "    %s  %-9s %-8s extras=%s KB root=%s KB  %s\n", $1, $2, $4, $5, $6, $9}'
+    fi
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# Queue / agent
+# ----------------------------------------------------------------------------
+valid_id() {
+    case "$1" in '' | .* | *[!A-Za-z0-9._-]*) return 1 ;; esac
+    [ "${#1}" -le 100 ]
+}
+
+valid_mode() { case "$1" in scan | clean | deep-scan | deep | report | status) return 0 ;; esac; return 1; }
+
+write_done() { # ID STATUS EXIT MODE [MESSAGE]
+    local f="$REPORTS_DIR/$1.done"
+    {
+        printf 'status=%s\nexit=%s\nmode=%s\nfinished=%s\n' "$2" "$3" "$4" "$(date '+%Y-%m-%d %H:%M:%S')"
+        [ -n "${5:-}" ] && printf 'message=%s\n' "$5"
+        printf 'summary=%s\nlog=%s\n' "$REPORTS_DIR/$1.summary.txt" "$REPORTS_DIR/$1.log"
+    } >"$f.tmp" && mv -f "$f.tmp" "$f"
+}
+
+agent_run() { # MODE ID
+    local rc
+    if [ "$1" = status ]; then
+        mode_status >"$REPORTS_DIR/$2.summary.txt" 2>&1
+        cp "$REPORTS_DIR/$2.summary.txt" "$REPORTS_DIR/$2.log" 2>/dev/null
+        write_done "$2" ok 0 status
+        return 0
+    fi
+    (run_mode "$1" "$2")
+    rc=$?
+    if [ "$rc" -eq 0 ]; then write_done "$2" ok 0 "$1"; else write_done "$2" error "$rc" "$1" "run ended with code $rc"; fi
+}
+
+agent_take_one() {
+    local p name id mode
+    for p in "$QUEUE_DIR"/* "$QUEUE_DIR"/.[!.]* "$QUEUE_DIR"/..?*; do
+        [ -e "$p" ] || [ -L "$p" ] || continue
+        name=${p##*/}
+        case "$name" in
+            .DS_Store | ._*) rm -f -- "$p"; return 0 ;;
+            *.req) id=${name%.req} ;;
+            *) mv -f -- "$p" "$REPORTS_DIR/rejected/" 2>/dev/null || rm -rf -- "$p"; return 0 ;;
+        esac
+        if [ -L "$p" ] || [ ! -f "$p" ] || ! valid_id "$id"; then
+            mv -f -- "$p" "$REPORTS_DIR/rejected/" 2>/dev/null || rm -rf -- "$p"
+            return 0
+        fi
+        mode=$(head -c 64 "$p" 2>/dev/null | head -n 1 | tr -d ' \t\r\n')
+        if [ -z "$mode" ]; then
+            # the writer may still be writing (requests can arrive via plain file copies)
+            sleep 2
+            mode=$(head -c 64 "$p" 2>/dev/null | head -n 1 | tr -d ' \t\r\n')
+        fi
+        mv -f -- "$p" "$REPORTS_DIR/$id.request" 2>/dev/null || rm -f -- "$p"
+        if ! valid_mode "$mode"; then
+            write_done "$id" rejected 2 "$mode" "unknown mode"
+            return 0
+        fi
+        if [ "$mode" != status ] && ! acquire_lock 1800; then
+            write_done "$id" busy 75 "$mode" "another MacClean run did not finish within 30 minutes"
+            return 0
+        fi
+        agent_run "$mode" "$id"
+        release_lock
+        return 0
+    done
+    return 1
+}
+
+idle_seconds() {
+    local s=""
+    [ "$OS" = Darwin ] && s=$(ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/ {print int($NF / 1000000000); exit}')
+    is_int "$s" && printf '%s' "$s" || printf '%s' "-1"
+}
+
+on_low_battery() {
+    [ "$OS" = Darwin ] || return 1
+    local b pct
+    b=$(pmset -g batt 2>/dev/null)
+    case "$b" in *"Battery Power"*) ;; *) return 1 ;; esac
+    pct=$(printf '%s' "$b" | grep -oE '[0-9]+%' | head -n 1 | tr -d '%')
+    is_int "$pct" && [ "$pct" -lt 40 ]
+}
+
+agent_maybe_scheduled() {
+    local interval last now idle overdue id
+    case "$SCHEDULE" in
+        weekly) interval=$((7 * 86400 - 3600)) ;;
+        daily) interval=$((86400 - 3600)) ;;
+        *) return 0 ;;
+    esac
+    now=$(date +%s)
+    last=$(cat "$STATE_DIR/last_scheduled" 2>/dev/null)
+    if ! is_int "${last:-}"; then
+        echo "$now" >"$STATE_DIR/last_scheduled"
+        return 0
+    fi
+    [ $((now - last)) -ge "$interval" ] || return 0
+    overdue=0
+    [ $((now - last)) -ge $((interval + 3 * 86400)) ] && overdue=1
+    idle=$(idle_seconds)
+    if [ "$overdue" = 0 ]; then
+        if [ "$idle" -ge 0 ] && [ "$idle" -lt $((IDLE_MINUTES * 60)) ]; then return 0; fi
+        on_low_battery && return 0
+    fi
+    acquire_lock 0 || return 0
+    id="$(date +%Y%m%d-%H%M%S)-scheduled"
+    LAST_FREED_KB=0
+    (run_mode clean "$id"; printf '%s' "${LAST_FREED_KB:-0}" >"$STATE_DIR/last_freed_kb")
+    release_lock
+    echo "$now" >"$STATE_DIR/last_scheduled"
+    if [ "$NOTIFY" = 1 ] && [ "$OS" = Darwin ]; then
+        local kb msg
+        kb=$(cat "$STATE_DIR/last_freed_kb" 2>/dev/null)
+        msg="Weekly cleanup finished."
+        is_int "${kb:-}" && msg="Weekly cleanup freed $(human_kb "$kb") (plus Mole). Report in ~/MacClean/reports."
+        osascript -e "display notification \"$msg\" with title \"MacClean\"" >/dev/null 2>&1
+    fi
+}
+
+cmd_agent() {
+    IN_AGENT=1
+    mkdir -p "$QUEUE_DIR" "$REPORTS_DIR/rejected" "$INBOX_TMP" "$STATE_DIR"
+    load_config
+    detect_fda
+    # scratch folders of runs that were killed (our own files only)
+    find "$STATE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'run.*' -mmin +720 -exec rm -rf {} + 2>/dev/null
+    local guard=0
+    while [ "$guard" -lt 100 ]; do
+        guard=$((guard + 1))
+        agent_take_one || break
+    done
+    agent_maybe_scheduled
+    return 0
+}
+
+cmd_queue() {
+    local mode="${1:-}" wait=0 id t=0
+    if ! valid_mode "$mode"; then
+        echo "usage: macclean queue <scan|clean|deep-scan|deep|report|status> [--wait SECONDS]" >&2
+        exit 2
+    fi
+    shift
+    if [ "${1:-}" = "--wait" ]; then wait="${2:-1800}"; fi
+    is_int "$wait" || wait=1800
+    mkdir -p "$QUEUE_DIR" "$INBOX_TMP" "$REPORTS_DIR"
+    id="$(date +%Y%m%d-%H%M%S)-$mode-$$"
+    printf '%s\n' "$mode" >"$INBOX_TMP/$id.req" && mv -f "$INBOX_TMP/$id.req" "$QUEUE_DIR/$id.req" || exit 1
+    echo "Queued '$mode' for the background agent as $id"
+    [ "$wait" -gt 0 ] || return 0
+    while [ ! -f "$REPORTS_DIR/$id.done" ]; do
+        sleep 2
+        t=$((t + 2))
+        if [ "$t" -ge "$wait" ]; then
+            echo "Still running - follow: tail -f $(tildify "$REPORTS_DIR/$id.log")"
+            return 3
+        fi
+    done
+    cat "$REPORTS_DIR/$id.summary.txt" 2>/dev/null || cat "$REPORTS_DIR/$id.done"
+}
+
+run_mode_cli() { # MODE [--no-mole] [--no-system]
+    local mode="$1" id no_mole=0 no_sys=0
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-mole) no_mole=1 ;;
+            --no-system) no_sys=1 ;;
+            *) echo "unknown option: $1" >&2; exit 2 ;;
+        esac
+        shift
+    done
+    load_config
+    [ "$no_mole" = 1 ] && USE_MOLE=0
+    [ "$no_sys" = 1 ] && SYSTEM_CLEAN=0
+    detect_fda
+    if [ "$mode" = status ]; then
+        mode_status
+        return 0
+    fi
+    if ! acquire_lock 0; then
+        echo "Another MacClean run is in progress (lock: $(tildify "$STATE_DIR/lock"))." >&2
+        exit 75
+    fi
+    id="$(date +%Y%m%d-%H%M%S)-$mode"
+    run_mode "$mode" "$id"
+    release_lock
+    echo
+    cat "$REPORTS_DIR/$id.summary.txt"
+}
+
+usage() {
+    sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+main() {
+    local cmd="${1:-help}"
+    [ $# -gt 0 ] && shift
+    case "$cmd" in
+        scan | clean | deep-scan | deep | report | status) run_mode_cli "$cmd" "$@" ;;
+        queue) cmd_queue "$@" ;;
+        agent) cmd_agent ;;
+        _ensure-whitelist) load_config; ensure_mole_whitelist ;;
+        version | --version | -v) echo "MacClean $MACCLEAN_VERSION" ;;
+        help | -h | --help) usage ;;
+        *) usage; exit 2 ;;
+    esac
+}
+
+main "$@"
